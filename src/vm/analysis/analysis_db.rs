@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use vm::analysis::errors::{CheckError, CheckErrors, CheckResult};
 use vm::analysis::type_checker::ContractAnalysis;
 use vm::database::{
-    ClarityBackingStore, ClarityDeserializable, ClaritySerializable, MarfedKV, RollbackWrapper,
+    ClarityBackingStore, ClarityDeserializable, ClaritySerializable, RollbackWrapper,
 };
 use vm::representations::ClarityName;
 use vm::types::signatures::FunctionSignature;
@@ -27,18 +27,6 @@ use vm::types::{FunctionType, QualifiedContractIdentifier, TraitIdentifier, Type
 
 pub struct AnalysisDatabase<'a> {
     store: RollbackWrapper<'a>,
-}
-
-impl ClaritySerializable for ContractAnalysis {
-    fn serialize(&self) -> String {
-        serde_json::to_string(self).expect("Failed to serialize vm.Value")
-    }
-}
-
-impl ClarityDeserializable<ContractAnalysis> for ContractAnalysis {
-    fn deserialize(json: &str) -> Self {
-        serde_json::from_str(json).expect("Failed to serialize vm.Value")
-    }
 }
 
 impl<'a> AnalysisDatabase<'a> {
@@ -76,7 +64,7 @@ impl<'a> AnalysisDatabase<'a> {
         self.store.rollback();
     }
 
-    fn storage_key() -> &'static str {
+    pub fn storage_key() -> &'static str {
         "analysis"
     }
 

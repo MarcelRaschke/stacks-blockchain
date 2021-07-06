@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -18,37 +18,31 @@ use std::collections::BTreeMap;
 
 use rusqlite::Connection;
 
-use chainstate::burn::{BurnchainHeaderHash, ConsensusHash, OpsHash, SortitionHash, Txid, VRFSeed};
-
-use util::db::Error as db_error;
-
-use core::*;
-
-use chainstate::burn::db::sortdb::{PoxId, SortitionHandleTx, SortitionId};
-use chainstate::burn::distribution::BurnSamplePoint;
-use chainstate::burn::operations::{
-    BlockstackOperation, BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp,
-    UserBurnSupportOp,
-};
-use chainstate::burn::{BlockHeaderHash, BlockSnapshot};
-
-use chainstate::stacks::index::MarfTrieId;
-use chainstate::stacks::StacksBlockId;
-
 use burnchains::Address;
 use burnchains::Burnchain;
 use burnchains::BurnchainBlock;
 use burnchains::BurnchainBlockHeader;
 use burnchains::PublicKey;
-
+use chainstate::burn::db::sortdb::SortitionHandleTx;
+use chainstate::burn::distribution::BurnSamplePoint;
+use chainstate::burn::operations::{
+    BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp, UserBurnSupportOp,
+};
+use chainstate::burn::BlockSnapshot;
+use chainstate::burn::{BurnchainHeaderHash, ConsensusHash, OpsHash, SortitionHash, Txid};
+use chainstate::stacks::db::StacksChainState;
+use chainstate::stacks::index::MarfTrieId;
+use core::*;
+use util::db::Error as db_error;
 use util::hash::Hash160;
+use util::log;
 use util::uint::BitArray;
 use util::uint::Uint256;
 use util::uint::Uint512;
 
-use chainstate::stacks::index::TrieHash;
-
-use util::log;
+use crate::types::chainstate::StacksBlockId;
+use crate::types::chainstate::{BlockHeaderHash, PoxId, SortitionId, VRFSeed};
+use crate::types::proof::{ClarityMarfTrieId, TrieHash};
 
 impl BlockSnapshot {
     /// Create the sentinel block snapshot -- the first one
@@ -81,7 +75,9 @@ impl BlockSnapshot {
             //  we shouldn't need to update this to use PoxId::initial(),
             //  but if we do, we need to update a lot of test cases.
             sortition_id: SortitionId::stubbed(first_burn_header_hash),
+            parent_sortition_id: SortitionId::stubbed(first_burn_header_hash),
             pox_valid: true,
+            accumulated_coinbase_ustx: 0,
         }
     }
 
@@ -96,7 +92,7 @@ impl BlockSnapshot {
     /// Given the weighted burns, VRF seed of the last winner, and sortition hash, pick the next
     /// winner.  Return the index into the distribution *if there is a sample to take*.
     fn sample_burn_distribution(
-        dist: &Vec<BurnSamplePoint>,
+        dist: &[BurnSamplePoint],
         VRF_seed: &VRFSeed,
         sortition_hash: &SortitionHash,
     ) -> Option<usize> {
@@ -139,7 +135,7 @@ impl BlockSnapshot {
         sort_tx: &mut SortitionHandleTx,
         block_header: &BurnchainBlockHeader,
         sortition_hash: &SortitionHash,
-        burn_dist: &Vec<BurnSamplePoint>,
+        burn_dist: &[BurnSamplePoint],
     ) -> Result<Option<LeaderBlockCommitOp>, db_error> {
         let burn_block_height = block_header.block_height;
 
@@ -187,6 +183,7 @@ impl BlockSnapshot {
         burn_total: u64,
         sortition_hash: &SortitionHash,
         txids: &Vec<Txid>,
+        accumulated_coinbase_ustx: u128,
     ) -> Result<BlockSnapshot, db_error> {
         let block_height = block_header.block_height;
         let block_hash = block_header.block_hash.clone();
@@ -231,7 +228,9 @@ impl BlockSnapshot {
                 .canonical_stacks_tip_consensus_hash
                 .clone(),
             sortition_id: sortition_id.clone(),
+            parent_sortition_id: parent_snapshot.sortition_id.clone(),
             pox_valid: true,
+            accumulated_coinbase_ustx,
         })
     }
 
@@ -252,8 +251,10 @@ impl BlockSnapshot {
         my_pox_id: &PoxId,
         parent_snapshot: &BlockSnapshot,
         block_header: &BurnchainBlockHeader,
-        burn_dist: &Vec<BurnSamplePoint>,
+        burn_dist: &[BurnSamplePoint],
         txids: &Vec<Txid>,
+        block_burn_total: Option<u64>,
+        initial_mining_bonus_ustx: u128,
     ) -> Result<BlockSnapshot, db_error> {
         assert_eq!(
             parent_snapshot.burn_header_hash,
@@ -269,6 +270,21 @@ impl BlockSnapshot {
         let last_sortition_hash = parent_snapshot.sortition_hash.clone();
         let last_burn_total = parent_snapshot.total_burn;
 
+        let accumulated_coinbase_ustx = if parent_snapshot.total_burn == 0 {
+            0
+        } else if parent_snapshot.sortition {
+            initial_mining_bonus_ustx
+        } else {
+            let missed_coinbase = StacksChainState::get_coinbase_reward(
+                parent_snapshot.block_height,
+                first_block_height,
+            );
+            parent_snapshot
+                .accumulated_coinbase_ustx
+                .saturating_add(missed_coinbase)
+                .saturating_add(initial_mining_bonus_ustx)
+        };
+
         // next sortition hash
         let next_sortition_hash = last_sortition_hash.mix_burn_header(&block_hash);
         let mut make_snapshot_no_sortition = || {
@@ -282,27 +298,31 @@ impl BlockSnapshot {
                 last_burn_total,
                 &next_sortition_hash,
                 &txids,
+                accumulated_coinbase_ustx,
             )
         };
 
         if burn_dist.len() == 0 {
             // no burns happened
             debug!(
-                "No burns happened in block {} {:?}",
-                block_height, &block_hash
+                "No burns happened in block";
+                "burn_block_height" => %block_height.to_string(),
+                "burn_block_hash" => %block_hash.to_string(),
             );
+
             return make_snapshot_no_sortition();
         }
 
         // NOTE: this only counts burns from leader block commits and user burns that match them.
         // It ignores user burns that don't match any block.
-        let block_burn_total = match BurnSamplePoint::get_total_burns(burn_dist) {
+        let block_burn_total = match block_burn_total {
             Some(total) => {
                 if total == 0 {
                     // no one burned, so no sortition
                     debug!(
-                        "No transactions submitted burns in block {} {:?}",
-                        block_height, &block_hash
+                        "No transactions submitted burns in block";
+                        "burn_block_height" => %block_height.to_string(),
+                        "burn_block_hash" => %block_hash.to_string(),
                     );
                     return make_snapshot_no_sortition();
                 } else {
@@ -379,29 +399,56 @@ impl BlockSnapshot {
                 .canonical_stacks_tip_consensus_hash
                 .clone(),
             sortition_id: my_sortition_id.clone(),
+            parent_sortition_id: parent_snapshot.sortition_id.clone(),
             pox_valid: true,
+            accumulated_coinbase_ustx,
         })
     }
 }
 
 #[cfg(test)]
 mod test {
-
-    use super::*;
+    use address::*;
     use burnchains::test::*;
     use burnchains::*;
     use chainstate::burn::db::sortdb::*;
     use chainstate::burn::operations::*;
-    use chainstate::burn::BlockHeaderHash;
-    use chainstate::burn::VRFSeed;
     use chainstate::stacks::*;
+    use util::get_epoch_time_secs;
+    use util::hash::hex_bytes;
     use util::vrf::VRFPrivateKey;
     use util::vrf::VRFPublicKey;
 
-    use util::get_epoch_time_secs;
-    use util::hash::hex_bytes;
+    use crate::types::chainstate::BlockHeaderHash;
+    use crate::types::chainstate::BurnchainHeaderHash;
+    use crate::types::chainstate::VRFSeed;
 
-    use address::*;
+    use super::*;
+
+    fn test_make_snapshot(
+        sort_tx: &mut SortitionHandleTx,
+        burnchain: &Burnchain,
+        my_sortition_id: &SortitionId,
+        my_pox_id: &PoxId,
+        parent_snapshot: &BlockSnapshot,
+        block_header: &BurnchainBlockHeader,
+        burn_dist: &[BurnSamplePoint],
+        txids: &Vec<Txid>,
+    ) -> Result<BlockSnapshot, db_error> {
+        let total_burn = BurnSamplePoint::get_total_burns(burn_dist);
+        BlockSnapshot::make_snapshot(
+            sort_tx,
+            burnchain,
+            my_sortition_id,
+            my_pox_id,
+            parent_snapshot,
+            block_header,
+            burn_dist,
+            txids,
+            total_burn,
+            0,
+        )
+    }
 
     #[test]
     fn make_snapshot_no_sortition() {
@@ -420,7 +467,9 @@ mod test {
             working_dir: "/nope".to_string(),
             consensus_hash_lifetime: 24,
             stable_confirmations: 7,
-            first_block_height: first_block_height,
+            first_block_timestamp: 0,
+            first_block_height,
+            initial_reward_start_block: first_block_height,
             first_block_hash: first_burn_hash.clone(),
         };
 
@@ -443,7 +492,7 @@ mod test {
             let pox_id = PoxId::stubbed();
             let sort_id = SortitionId::stubbed(&empty_block_header.block_hash);
             let mut ic = SortitionHandleTx::begin(&mut db, &sort_id).unwrap();
-            let sn = BlockSnapshot::make_snapshot(
+            let sn = test_make_snapshot(
                 &mut ic,
                 &burnchain,
                 &sort_id,
@@ -483,20 +532,13 @@ mod test {
                 &VRFSeed::initial(),
                 &key,
                 0,
+                &(Txid([0; 32]), 0),
                 &BurnchainSigner::new_p2pkh(
                     &StacksPublicKey::from_hex(
                         "03ef2340518b5867b23598a9cf74611f8b98064f7d55cdb8c107c67b5efcbc5c77",
                     )
                     .unwrap(),
                 ),
-            ),
-            key: LeaderKeyRegisterOp::new(
-                &StacksAddress::new(0, Hash160([0u8; 20])),
-                &VRFPublicKey::from_bytes(
-                    &hex_bytes("a366b51292bef4edd64063d9145c617fec373bceb0758e98cd72becd84d54c7a")
-                        .unwrap(),
-                )
-                .unwrap(),
             ),
             user_burns: vec![],
         };
@@ -505,7 +547,7 @@ mod test {
             let sort_id = SortitionId::stubbed(&empty_block_header.block_hash);
             let pox_id = PoxId::stubbed();
             let mut ic = SortitionHandleTx::begin(&mut db, &sort_id).unwrap();
-            let sn = BlockSnapshot::make_snapshot(
+            let sn = test_make_snapshot(
                 &mut ic,
                 &burnchain,
                 &sort_id,
@@ -522,6 +564,4 @@ mod test {
         assert!(!snapshot_no_burns.sortition);
         assert_eq!(snapshot_no_transactions.total_burn, 0);
     }
-
-    // TODO: make snapshot with sortition
 }

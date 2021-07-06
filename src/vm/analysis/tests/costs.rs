@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,33 +14,29 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use chainstate::stacks::index::storage::TrieFileStorage;
+use clarity_vm::clarity::ClarityInstance;
 use util::hash::hex_bytes;
-use vm::clarity::ClarityInstance;
+use vm::contexts::Environment;
 use vm::contexts::{AssetMap, AssetMapEntry, GlobalContext, OwnedEnvironment};
 use vm::contracts::Contract;
+use vm::costs::ExecutionCost;
+use vm::database::{ClarityDatabase, NULL_BURN_STATE_DB, NULL_HEADER_DB};
 use vm::errors::{CheckErrors, Error, RuntimeErrorType};
 use vm::execute as vm_execute;
 use vm::functions::NativeFunctions;
 use vm::representations::SymbolicExpression;
+use vm::tests::costs::get_simple_test;
 use vm::tests::{execute, symbols_from_values, with_marfed_environment, with_memory_environment};
 use vm::types::{AssetIdentifier, PrincipalData, QualifiedContractIdentifier, ResponseData, Value};
 
-use vm::contexts::Environment;
-use vm::costs::ExecutionCost;
-use vm::database::{
-    ClarityDatabase, MarfedKV, MemoryBackingStore, NULL_BURN_STATE_DB, NULL_HEADER_DB,
-};
-
-use chainstate::burn::BlockHeaderHash;
-use chainstate::stacks::index::storage::TrieFileStorage;
-use chainstate::stacks::index::MarfTrieId;
-use chainstate::stacks::StacksBlockId;
-
-use vm::tests::costs::get_simple_test;
+use crate::clarity_vm::database::marf::MarfedKV;
+use crate::types::chainstate::{BlockHeaderHash, StacksBlockId};
+use crate::types::proof::ClarityMarfTrieId;
 
 pub fn test_tracked_costs(prog: &str) -> ExecutionCost {
     let marf = MarfedKV::temporary();
-    let mut clarity_instance = ClarityInstance::new(marf, ExecutionCost::max_value());
+    let mut clarity_instance = ClarityInstance::new(false, marf, ExecutionCost::max_value());
 
     let p1 = execute("'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR");
 
@@ -53,19 +49,19 @@ pub fn test_tracked_costs(prog: &str) -> ExecutionCost {
                             (foo-exec (int) (response int int))
                           ))";
     let contract_other = "(impl-trait .contract-trait.trait-1)
-                          (define-map map-foo ((a int)) ((b int)))
+                          (define-map map-foo { a: int } { b: int })
                           (define-public (foo-exec (a int)) (ok 1))";
 
     let contract_self = format!(
-        "(define-map map-foo ((a int)) ((b int)))
-                         (define-non-fungible-token nft-foo int)
-                         (define-fungible-token ft-foo)
-                         (define-data-var var-foo int 0)
-                         (define-constant tuple-foo (tuple (a 1)))
-                         (define-constant list-foo (list true))
-                         (define-constant list-bar (list 1))
-                         (use-trait trait-1 .contract-trait.trait-1)
-                         (define-public (execute (contract <trait-1>)) (ok {}))",
+        "(define-map map-foo {{ a: int }} {{ b: int }})
+        (define-non-fungible-token nft-foo int)
+        (define-fungible-token ft-foo)
+        (define-data-var var-foo int 0)
+        (define-constant tuple-foo (tuple (a 1)))
+        (define-constant list-foo (list true))
+        (define-constant list-bar (list 1))
+        (use-trait trait-1 .contract-trait.trait-1)
+        (define-public (execute (contract <trait-1>)) (ok {}))",
         prog
     );
 
@@ -75,10 +71,19 @@ pub fn test_tracked_costs(prog: &str) -> ExecutionCost {
     let trait_contract_id =
         QualifiedContractIdentifier::new(p1_principal.clone(), "contract-trait".into());
 
-    {
-        let mut conn = clarity_instance.begin_block(
+    clarity_instance
+        .begin_test_genesis_block(
             &StacksBlockId::sentinel(),
             &StacksBlockId([0 as u8; 32]),
+            &NULL_HEADER_DB,
+            &NULL_BURN_STATE_DB,
+        )
+        .commit_block();
+
+    {
+        let mut conn = clarity_instance.begin_block(
+            &StacksBlockId([0 as u8; 32]),
+            &StacksBlockId([1 as u8; 32]),
             &NULL_HEADER_DB,
             &NULL_BURN_STATE_DB,
         );
@@ -99,8 +104,8 @@ pub fn test_tracked_costs(prog: &str) -> ExecutionCost {
 
     {
         let mut conn = clarity_instance.begin_block(
-            &StacksBlockId([0 as u8; 32]),
             &StacksBlockId([1 as u8; 32]),
+            &StacksBlockId([2 as u8; 32]),
             &NULL_HEADER_DB,
             &NULL_BURN_STATE_DB,
         );
@@ -121,8 +126,8 @@ pub fn test_tracked_costs(prog: &str) -> ExecutionCost {
 
     {
         let mut conn = clarity_instance.begin_block(
-            &StacksBlockId([1 as u8; 32]),
             &StacksBlockId([2 as u8; 32]),
+            &StacksBlockId([3 as u8; 32]),
             &NULL_HEADER_DB,
             &NULL_BURN_STATE_DB,
         );

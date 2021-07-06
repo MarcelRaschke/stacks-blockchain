@@ -67,7 +67,7 @@ start_bitcoind_controller() {
    logln "ok"
 
    log "[$$] Starting bitcoind controller..."
-   bitcoin-neon-controller "$BITCOIN_CONTROLLER_CONF" >"$BITCOIN_CONTROLLER_LOGFILE" 2>&1 &
+   puppet-chain "$BITCOIN_CONTROLLER_CONF" >"$BITCOIN_CONTROLLER_LOGFILE" 2>&1 &
    local RC=$?
    local BITCOIN_NEON_CONTROLLER_PID=$!
 
@@ -136,6 +136,10 @@ start_stacks_master_node() {
       -e "s/@@STACKS_DENY_NODES@@/$STACKS_MASTER_DENY_NODES/g" \
       -e "s/@@DISABLE_INBOUND_HANDSHAKES@@/$STACKS_MASTER_DISABLE_INBOUND_HANDSHAKES/g" \
       -e "s/@@DISABLE_INBOUND_WALKS@@/$STACKS_MASTER_DISABLE_INBOUND_WALKS/g" \
+      -e "s/@@STACKS_MASTER_MINE_MICROBLOCKS@@/$STACKS_MASTER_MINE_MICROBLOCKS/g" \
+      -e "s/@@STACKS_MASTER_MICROBLOCK_FREQUENCY@@/$STACKS_MASTER_MICROBLOCK_FREQUENCY/g" \
+      -e "s/@@STACKS_MASTER_MAX_MICROBLOCKS@@/$STACKS_MASTER_MAX_MICROBLOCKS/g" \
+      -e "s/@@STACKS_MASTER_WAIT_FOR_MICROBLOCKS@@/$STACKS_MASTER_WAIT_FOR_MICROBLOCKS/g" \
       "$STACKS_MASTER_CONF_IN" \
       > "$STACKS_MASTER_CONF"
    logln "ok"
@@ -171,6 +175,10 @@ start_stacks_miner_node() {
       -e "s/@@PROCESS_EXIT_AT_BLOCK_HEIGHT@@/$PROCESS_EXIT_AT_BLOCK_HEIGHT/g" \
       -e "s/@@DISABLE_INBOUND_HANDSHAKES@@/$STACKS_MINER_DISABLE_INBOUND_HANDSHAKES/g" \
       -e "s/@@DISABLE_INBOUND_WALKS@@/$STACKS_MINER_DISABLE_INBOUND_WALKS/g" \
+      -e "s/@@STACKS_MINER_MINE_MICROBLOCKS@@/$STACKS_MINER_MINE_MICROBLOCKS/g" \
+      -e "s/@@STACKS_MINER_MICROBLOCK_FREQUENCY@@/$STACKS_MINER_MICROBLOCK_FREQUENCY/g" \
+      -e "s/@@STACKS_MINER_MAX_MICROBLOCKS@@/$STACKS_MINER_MAX_MICROBLOCKS/g" \
+      -e "s/@@STACKS_MINER_WAIT_FOR_MICROBLOCKS@@/$STACKS_MINER_WAIT_FOR_MICROBLOCKS/g" \
       "$STACKS_MINER_CONF_IN" \
       > "$STACKS_MINER_CONF"
    logln "ok"
@@ -198,7 +206,7 @@ start_stacks_miner_node() {
 
    log "[$$]  Waiting for BTC to get confirmed..."
    TIMEOUT=2
-   for i in $(seq 1 10); do
+   for i in $(seq 1 20); do
        CONFIRMATIONS="$(curl -sf "$FAUCET_URL"/bitcoin/confirmations/"$TXID")"
        local RC=$?
        if [ $RC -ne 0 ]; then 
@@ -406,7 +414,7 @@ wait_node() {
          ;;
    esac
    local CNT=0
-   for CNT in $(seq 1 120); do
+   for CNT in $(seq 1 360); do
       curl -sLf "http://$RPC_HOST:$RPC_PORT/v2/info" >/dev/null 2>&1
       if [ $? -eq 0 ]; then
          return 0
@@ -486,7 +494,7 @@ report() {
 
 is_sourced
 if [ $? -ne 0 ]; then 
-   for cmd in bitcoind bitcoin-cli bitcoin-neon-controller stacks-node blockstack-cli date jq grep sed kill cat curl faucet.sh seq; do
+   for cmd in bitcoind bitcoin-cli puppet-chain stacks-node blockstack-cli date jq grep sed kill cat curl faucet.sh seq; do
       which $cmd 2>&1 >/dev/null || exit_error "Missing \"$cmd\""
    done
 

@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,23 +14,21 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use chainstate::stacks::index::storage::TrieFileStorage;
+use core::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
 use util::hash::hex_bytes;
 use vm::contexts::{Environment, GlobalContext, OwnedEnvironment};
 use vm::contracts::Contract;
-use vm::database::{
-    ClarityDatabase, MarfedKV, MemoryBackingStore, NULL_BURN_STATE_DB, NULL_HEADER_DB,
-};
+use vm::database::{ClarityDatabase, NULL_BURN_STATE_DB, NULL_HEADER_DB};
 use vm::errors::Error;
 use vm::execute as vm_execute;
 use vm::representations::SymbolicExpression;
 use vm::types::{PrincipalData, ResponseData, Value};
 
-use chainstate::stacks::index::storage::TrieFileStorage;
-use chainstate::stacks::index::MarfTrieId;
-use chainstate::stacks::StacksBlockHeader;
-use chainstate::stacks::StacksBlockId;
-
-use core::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
+use crate::clarity_vm::database::marf::MarfedKV;
+use crate::clarity_vm::database::MemoryBackingStore;
+use crate::types::chainstate::{StacksBlockHeader, StacksBlockId};
+use crate::types::proof::ClarityMarfTrieId;
 
 mod assets;
 mod contracts;
@@ -64,32 +62,33 @@ where
     F: FnOnce(&mut OwnedEnvironment) -> (),
 {
     let mut marf_kv = MarfedKV::temporary();
-    marf_kv.begin(
-        &StacksBlockId::sentinel(),
-        &StacksBlockHeader::make_index_block_hash(
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-        ),
-    );
 
     {
-        marf_kv
+        let mut store = marf_kv.begin(
+            &StacksBlockId::sentinel(),
+            &StacksBlockHeader::make_index_block_hash(
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+            ),
+        );
+
+        store
             .as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB)
             .initialize();
+        store.test_commit();
     }
 
-    marf_kv.test_commit();
-    marf_kv.begin(
-        &StacksBlockHeader::make_index_block_hash(
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-        ),
-        &StacksBlockId([1 as u8; 32]),
-    );
-
     {
+        let mut store = marf_kv.begin(
+            &StacksBlockHeader::make_index_block_hash(
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+            ),
+            &StacksBlockId([1 as u8; 32]),
+        );
+
         let mut owned_env =
-            OwnedEnvironment::new(marf_kv.as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB));
+            OwnedEnvironment::new(store.as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB));
         // start an initial transaction.
         if !top_level {
             owned_env.begin();
@@ -103,8 +102,8 @@ pub fn execute(s: &str) -> Value {
     vm_execute(s).unwrap().unwrap()
 }
 
-pub fn symbols_from_values(mut vec: Vec<Value>) -> Vec<SymbolicExpression> {
-    vec.drain(..)
+pub fn symbols_from_values(vec: Vec<Value>) -> Vec<SymbolicExpression> {
+    vec.into_iter()
         .map(|value| SymbolicExpression::atom_value(value))
         .collect()
 }

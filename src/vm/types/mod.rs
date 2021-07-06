@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -26,6 +26,7 @@ use regex::Regex;
 
 use address::c32;
 use util::hash;
+
 use vm::errors::{
     CheckErrors, IncomparableError, InterpreterError, InterpreterResult as Result, RuntimeErrorType,
 };
@@ -65,7 +66,7 @@ pub struct ListData {
     pub type_signature: ListTypeData,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+#[derive(Clone, Eq, PartialEq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct StandardPrincipalData(pub u8, pub [u8; 20]);
 
 impl StandardPrincipalData {
@@ -238,6 +239,96 @@ impl SequenceData {
             SequenceData::List(data) => data.items().len(),
             SequenceData::String(CharType::ASCII(data)) => data.items().len(),
             SequenceData::String(CharType::UTF8(data)) => data.items().len(),
+        }
+    }
+
+    pub fn element_at(self, index: usize) -> Option<Value> {
+        if self.len() <= index {
+            return None;
+        }
+        let result = match self {
+            SequenceData::Buffer(data) => Value::buff_from_byte(data.data[index]),
+            SequenceData::List(mut data) => data.data.remove(index),
+            SequenceData::String(CharType::ASCII(data)) => {
+                Value::string_ascii_from_bytes(vec![data.data[index]])
+                    .expect("BUG: failed to initialize single-byte ASCII buffer")
+            }
+            SequenceData::String(CharType::UTF8(mut data)) => {
+                Value::Sequence(SequenceData::String(CharType::UTF8(UTF8Data {
+                    data: vec![data.data.remove(index)],
+                })))
+            }
+        };
+
+        Some(result)
+    }
+
+    pub fn contains(&self, to_find: Value) -> Result<Option<usize>> {
+        match self {
+            SequenceData::Buffer(ref data) => {
+                if let Value::Sequence(SequenceData::Buffer(to_find_vec)) = to_find {
+                    if to_find_vec.data.len() != 1 {
+                        Ok(None)
+                    } else {
+                        for (index, entry) in data.data.iter().enumerate() {
+                            if entry == &to_find_vec.data[0] {
+                                return Ok(Some(index));
+                            }
+                        }
+                        Ok(None)
+                    }
+                } else {
+                    Err(CheckErrors::TypeValueError(TypeSignature::min_buffer(), to_find).into())
+                }
+            }
+            SequenceData::List(ref data) => {
+                for (index, entry) in data.data.iter().enumerate() {
+                    if entry == &to_find {
+                        return Ok(Some(index));
+                    }
+                }
+                Ok(None)
+            }
+            SequenceData::String(CharType::ASCII(ref data)) => {
+                if let Value::Sequence(SequenceData::String(CharType::ASCII(to_find_vec))) = to_find
+                {
+                    if to_find_vec.data.len() != 1 {
+                        Ok(None)
+                    } else {
+                        for (index, entry) in data.data.iter().enumerate() {
+                            if entry == &to_find_vec.data[0] {
+                                return Ok(Some(index));
+                            }
+                        }
+                        Ok(None)
+                    }
+                } else {
+                    Err(
+                        CheckErrors::TypeValueError(TypeSignature::min_string_ascii(), to_find)
+                            .into(),
+                    )
+                }
+            }
+            SequenceData::String(CharType::UTF8(ref data)) => {
+                if let Value::Sequence(SequenceData::String(CharType::UTF8(to_find_vec))) = to_find
+                {
+                    if to_find_vec.data.len() != 1 {
+                        Ok(None)
+                    } else {
+                        for (index, entry) in data.data.iter().enumerate() {
+                            if entry == &to_find_vec.data[0] {
+                                return Ok(Some(index));
+                            }
+                        }
+                        Ok(None)
+                    }
+                } else {
+                    Err(
+                        CheckErrors::TypeValueError(TypeSignature::min_string_utf8(), to_find)
+                            .into(),
+                    )
+                }
+            }
         }
     }
 
@@ -722,6 +813,15 @@ impl Value {
         ))))
     }
 
+    pub fn expect_ascii(self) -> String {
+        if let Value::Sequence(SequenceData::String(CharType::ASCII(ASCIIData { data }))) = self {
+            String::from_utf8(data).unwrap()
+        } else {
+            error!("Value '{:?}' is not an ASCII string", &self);
+            panic!();
+        }
+    }
+
     pub fn expect_u128(self) -> u128 {
         if let Value::UInt(inner) = self {
             inner
@@ -754,6 +854,15 @@ impl Value {
             }
         } else {
             error!("Value '{:?}' is not a buff", &self);
+            panic!();
+        }
+    }
+
+    pub fn expect_list(self) -> Vec<Value> {
+        if let Value::Sequence(SequenceData::List(listdata)) = self {
+            listdata.data
+        } else {
+            error!("Value '{:?}' is not a list", &self);
             panic!();
         }
     }
@@ -1011,6 +1120,13 @@ impl fmt::Display for StandardPrincipalData {
     }
 }
 
+impl fmt::Debug for StandardPrincipalData {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let c32_str = self.to_address();
+        write!(f, "StandardPrincipalData({})", c32_str)
+    }
+}
+
 impl fmt::Display for PrincipalData {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -1126,6 +1242,18 @@ impl TupleData {
         self.data_map.remove(name).ok_or_else(|| {
             CheckErrors::NoSuchTupleField(name.to_string(), self.type_signature.clone()).into()
         })
+    }
+
+    pub fn shallow_merge(mut base: TupleData, updates: TupleData) -> Result<TupleData> {
+        let TupleData {
+            data_map,
+            mut type_signature,
+        } = updates;
+        for (name, value) in data_map.into_iter() {
+            base.data_map.insert(name, value);
+        }
+        base.type_signature.shallow_merge(&mut type_signature);
+        Ok(base)
     }
 }
 

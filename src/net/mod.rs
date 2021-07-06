@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,26 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-pub mod asn;
-pub mod chat;
-pub mod codec;
-pub mod connection;
-pub mod db;
-pub mod dns;
-pub mod download;
-pub mod http;
-pub mod inv;
-pub mod neighbors;
-pub mod p2p;
-pub mod poll;
-pub mod prune;
-pub mod relay;
-pub mod rpc;
-pub mod server;
-
 use std::borrow::Borrow;
 use std::cmp::PartialEq;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::From;
 use std::convert::TryFrom;
 use std::error;
@@ -50,66 +33,75 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::str::FromStr;
 
-use rusqlite;
-use url;
-
 use rand::thread_rng;
 use rand::RngCore;
-
+use regex::Regex;
+use rusqlite;
+use serde::de::Error as de_Error;
+use serde::ser::Error as ser_Error;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use url;
 
-use regex::Regex;
-
-use core::mempool::*;
-
-use burnchains::BurnchainHeaderHash;
 use burnchains::Txid;
-use burnchains::BURNCHAIN_HEADER_HASH_ENCODED_SIZE;
-
-use chainstate::burn::BlockHeaderHash;
 use chainstate::burn::ConsensusHash;
-
-use chainstate::burn::db::sortdb::PoxId;
-
 use chainstate::stacks::db::blocks::MemPoolRejection;
-use chainstate::stacks::{
-    Error as chain_error, StacksAddress, StacksBlock, StacksBlockId, StacksMicroblock,
-    StacksPublicKey, StacksTransaction,
-};
-
+use chainstate::stacks::index::Error as marf_error;
 use chainstate::stacks::Error as chainstate_error;
-
+use chainstate::stacks::{
+    Error as chain_error, StacksBlock, StacksMicroblock, StacksPublicKey, StacksTransaction,
+};
+use clarity_vm::clarity::Error as clarity_error;
+use codec::Error as codec_error;
+use codec::StacksMessageCodec;
+use core::mempool::*;
+use core::POX_REWARD_CYCLE_LENGTH;
+use net::atlas::{Attachment, AttachmentInstance};
+use util::db::DBConn;
+use util::db::Error as db_error;
+use util::get_epoch_time_secs;
+use util::hash::Hash160;
+use util::hash::DOUBLE_SHA256_ENCODED_SIZE;
+use util::hash::HASH160_ENCODED_SIZE;
+use util::hash::{hex_bytes, to_hex};
+use util::log;
+use util::secp256k1::MessageSignature;
+use util::secp256k1::Secp256k1PublicKey;
+use util::secp256k1::MESSAGE_SIGNATURE_ENCODED_SIZE;
+use util::strings::UrlString;
+use vm::types::TraitIdentifier;
 use vm::{
     analysis::contract_interface_builder::ContractInterface, types::PrincipalData, ClarityName,
     ContractName, Value,
 };
 
-use util::hash::Hash160;
-use util::hash::DOUBLE_SHA256_ENCODED_SIZE;
-use util::hash::HASH160_ENCODED_SIZE;
-
-use util::db::DBConn;
-use util::db::Error as db_error;
-
-use util::log;
-
-use util::secp256k1::MessageSignature;
-use util::secp256k1::Secp256k1PublicKey;
-use util::secp256k1::MESSAGE_SIGNATURE_ENCODED_SIZE;
-use util::strings::UrlString;
-
-use util::get_epoch_time_secs;
-
-use serde::de::Error as de_Error;
-use serde::ser::Error as ser_Error;
-
-use chainstate::stacks::index::Error as marf_error;
-use vm::clarity::Error as clarity_error;
+use crate::codec::BURNCHAIN_HEADER_HASH_ENCODED_SIZE;
+use crate::types::chainstate::BlockHeaderHash;
+use crate::types::chainstate::PoxId;
+use crate::types::chainstate::{BurnchainHeaderHash, StacksAddress, StacksBlockId};
+use crate::types::StacksPublicKeyBuffer;
+use crate::util::hash::Sha256Sum;
 
 use self::dns::*;
+pub use self::http::StacksHttp;
 
-use core::POX_REWARD_CYCLE_LENGTH;
+pub mod asn;
+pub mod atlas;
+pub mod chat;
+pub mod codec;
+pub mod connection;
+pub mod db;
+pub mod dns;
+pub mod download;
+pub mod http;
+pub mod inv;
+pub mod neighbors;
+pub mod p2p;
+pub mod poll;
+pub mod prune;
+pub mod relay;
+pub mod rpc;
+pub mod server;
 
 #[derive(Debug)]
 pub enum Error {
@@ -215,6 +207,20 @@ pub enum Error {
     ConnectionCycle,
     /// Requested data not found
     NotFoundError,
+}
+
+impl From<codec_error> for Error {
+    fn from(e: codec_error) -> Self {
+        match e {
+            codec_error::SerializeError(s) => Error::SerializeError(s),
+            codec_error::ReadError(e) => Error::ReadError(e),
+            codec_error::DeserializeError(s) => Error::DeserializeError(s),
+            codec_error::WriteError(e) => Error::WriteError(e),
+            codec_error::UnderflowError(s) => Error::UnderflowError(s),
+            codec_error::OverflowError(s) => Error::OverflowError(s),
+            codec_error::ArrayTooLong => Error::ArrayTooLong,
+        }
+    }
 }
 
 /// Enum for passing data for ClientErrors
@@ -407,29 +413,6 @@ impl PartialEq for Error {
     }
 }
 
-/// Helper trait for various primitive types that make up Stacks messages
-pub trait StacksMessageCodec {
-    /// serialize implementors _should never_ error unless there is an underlying
-    ///   failure in writing to the `fd`
-    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), Error>
-    where
-        Self: Sized;
-    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<Self, Error>
-    where
-        Self: Sized;
-    /// Convenience for serialization to a vec.
-    ///  this function unwraps any underlying serialization error
-    fn serialize_to_vec(&self) -> Vec<u8>
-    where
-        Self: Sized,
-    {
-        let mut bytes = vec![];
-        self.consensus_serialize(&mut bytes)
-            .expect("BUG: serialization to buffer failed.");
-        bytes
-    }
-}
-
 /// A container for an IPv4 or IPv6 address.
 /// Rules:
 /// -- If this is an IPv6 address, the octets are in network byte order
@@ -438,7 +421,6 @@ pub struct PeerAddress([u8; 16]);
 impl_array_newtype!(PeerAddress, u8, 16);
 impl_array_hexstring_fmt!(PeerAddress);
 impl_byte_array_newtype!(PeerAddress, u8, 16);
-pub const PEER_ADDRESS_ENCODED_SIZE: u32 = 16;
 
 impl Serialize for PeerAddress {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -582,13 +564,19 @@ impl PeerAddress {
     pub fn is_anynet(&self) -> bool {
         self.0 == [0x00; 16] || self == &PeerAddress::from_ipv4(0, 0, 0, 0)
     }
-}
 
-/// A container for public keys (compressed secp256k1 public keys)
-pub struct StacksPublicKeyBuffer(pub [u8; 33]);
-impl_array_newtype!(StacksPublicKeyBuffer, u8, 33);
-impl_array_hexstring_fmt!(StacksPublicKeyBuffer);
-impl_byte_array_newtype!(StacksPublicKeyBuffer, u8, 33);
+    /// Is this a private IP address?
+    pub fn is_in_private_range(&self) -> bool {
+        if self.is_ipv4() {
+            // 10.0.0.0/8, 172.16.0.0/12, or 192.168.0.0/16
+            self.0[12] == 10
+                || (self.0[12] == 172 && self.0[13] >= 16 && self.0[13] <= 31)
+                || (self.0[12] == 192 && self.0[13] == 168)
+        } else {
+            self.0[0] >= 0xfc
+        }
+    }
+}
 
 pub const STACKS_PUBLIC_KEY_ENCODED_SIZE: u32 = 33;
 
@@ -617,9 +605,9 @@ impl HttpContentType {
 }
 
 impl FromStr for HttpContentType {
-    type Err = Error;
+    type Err = codec_error;
 
-    fn from_str(header: &str) -> Result<HttpContentType, Error> {
+    fn from_str(header: &str) -> Result<HttpContentType, codec_error> {
         let s = header.to_string().to_lowercase();
         if s == "application/octet-stream" {
             Ok(HttpContentType::Bytes)
@@ -628,7 +616,7 @@ impl FromStr for HttpContentType {
         } else if s == "application/json" {
             Ok(HttpContentType::JSON)
         } else {
-            Err(Error::DeserializeError(
+            Err(codec_error::DeserializeError(
                 "Unsupported HTTP content type".to_string(),
             ))
         }
@@ -678,18 +666,6 @@ pub struct Preamble {
     pub signature: MessageSignature, // signature from the peer that sent this
     pub payload_len: u32,     // length of the following payload, including relayers vector
 }
-
-/// P2P preamble length (addands correspond to fields above)
-pub const PREAMBLE_ENCODED_SIZE: u32 = 4
-    + 4
-    + 4
-    + 8
-    + BURNCHAIN_HEADER_HASH_ENCODED_SIZE
-    + 8
-    + BURNCHAIN_HEADER_HASH_ENCODED_SIZE
-    + 4
-    + MESSAGE_SIGNATURE_ENCODED_SIZE
-    + 4;
 
 /// Request for a block inventory or a list of blocks.
 /// Aligned to a PoX reward cycle.
@@ -787,8 +763,6 @@ impl NeighborAddress {
     }
 }
 
-pub const NEIGHBOR_ADDRESS_ENCODED_SIZE: u32 = PEER_ADDRESS_ENCODED_SIZE + 2 + HASH160_ENCODED_SIZE;
-
 /// A descriptor of a list of known peers
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NeighborsData {
@@ -858,8 +832,6 @@ pub struct RelayData {
     pub peer: NeighborAddress,
     pub seq: u32,
 }
-
-pub const RELAY_DATA_ENCODED_SIZE: u32 = NEIGHBOR_ADDRESS_ENCODED_SIZE + 4;
 
 /// All P2P message types
 #[derive(Debug, Clone, PartialEq)]
@@ -998,22 +970,54 @@ pub struct RPCPeerInfoData {
     pub stacks_tip_height: u64,
     pub stacks_tip: BlockHeaderHash,
     pub stacks_tip_consensus_hash: String,
+    pub genesis_chainstate_hash: Sha256Sum,
     pub unanchored_tip: StacksBlockId,
+    pub unanchored_seq: u16,
     pub exit_at_block_height: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RPCPoxCurrentCycleInfo {
+    pub id: u64,
+    pub min_threshold_ustx: u64,
+    pub stacked_ustx: u64,
+    pub is_pox_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RPCPoxNextCycleInfo {
+    pub id: u64,
+    pub min_threshold_ustx: u64,
+    pub min_increment_ustx: u64,
+    pub stacked_ustx: u64,
+    pub prepare_phase_start_block_height: u64,
+    pub blocks_until_prepare_phase: i64,
+    pub reward_phase_start_block_height: u64,
+    pub blocks_until_reward_phase: u64,
+    pub ustx_until_pox_rejection: u64,
 }
 
 /// The data we return on GET /v2/pox
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RPCPoxInfoData {
     pub contract_id: String,
-    pub first_burnchain_block_height: u128,
-    pub min_amount_ustx: u128,
-    pub prepare_cycle_length: u128,
-    pub rejection_fraction: u128,
-    pub reward_cycle_id: u128,
-    pub reward_cycle_length: u128,
-    pub rejection_votes_left_required: u128,
-    pub total_liquid_supply_ustx: u128,
+    pub pox_activation_threshold_ustx: u64,
+    pub first_burnchain_block_height: u64,
+    pub prepare_phase_block_length: u64,
+    pub reward_phase_block_length: u64,
+    pub reward_slots: u64,
+    pub rejection_fraction: u64,
+    pub total_liquid_supply_ustx: u64,
+    pub current_cycle: RPCPoxCurrentCycleInfo,
+    pub next_cycle: RPCPoxNextCycleInfo,
+
+    // below are included for backwards-compatibility
+    pub min_amount_ustx: u64,
+    pub prepare_cycle_length: u64,
+    pub reward_cycle_id: u64,
+    pub reward_cycle_length: u64,
+    pub rejection_votes_left_required: u64,
+    pub next_reward_cycle_in: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Copy, Hash)]
@@ -1050,6 +1054,11 @@ pub struct ContractSrcResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetIsTraitImplementedResponse {
+    pub is_implemented: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallReadOnlyResponse {
     pub okay: bool,
     #[serde(default)]
@@ -1072,6 +1081,61 @@ pub struct AccountEntryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub nonce_proof: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum UnconfirmedTransactionStatus {
+    Microblock {
+        block_hash: BlockHeaderHash,
+        seq: u16,
+    },
+    Mempool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnconfirmedTransactionResponse {
+    pub tx: String,
+    pub status: UnconfirmedTransactionStatus,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PostTransactionRequestBody {
+    pub tx: String,
+    pub attachment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GetAttachmentResponse {
+    pub attachment: Attachment,
+}
+
+impl Serialize for GetAttachmentResponse {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let hex_encoded = to_hex(&self.attachment.content[..]);
+        s.serialize_str(hex_encoded.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for GetAttachmentResponse {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<GetAttachmentResponse, D::Error> {
+        let payload = String::deserialize(d)?;
+        let hex_encoded = payload.parse::<String>().map_err(de_Error::custom)?;
+        let bytes = hex_bytes(&hex_encoded).map_err(de_Error::custom)?;
+        let attachment = Attachment::new(bytes);
+        Ok(GetAttachmentResponse { attachment })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetAttachmentsInvResponse {
+    pub block_id: StacksBlockId,
+    pub pages: Vec<AttachmentPage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentPage {
+    pub index: u32,
+    pub inventory: Vec<u8>,
 }
 
 /// Request ID to use or expect from non-Stacks HTTP clients.
@@ -1155,7 +1219,9 @@ pub enum HttpRequestType {
     GetMicroblocksIndexed(HttpRequestMetadata, StacksBlockId),
     GetMicroblocksConfirmed(HttpRequestMetadata, StacksBlockId),
     GetMicroblocksUnconfirmed(HttpRequestMetadata, StacksBlockId, u16),
-    PostTransaction(HttpRequestMetadata, StacksTransaction),
+    GetTransactionUnconfirmed(HttpRequestMetadata, Txid),
+    PostTransaction(HttpRequestMetadata, StacksTransaction, Option<Attachment>),
+    PostBlock(HttpRequestMetadata, ConsensusHash, StacksBlock),
     PostMicroblock(HttpRequestMetadata, StacksMicroblock, Option<StacksBlockId>),
     GetAccount(
         HttpRequestMetadata,
@@ -1196,6 +1262,15 @@ pub enum HttpRequestType {
         Option<StacksBlockId>,
     ),
     OptionsPreflight(HttpRequestMetadata, String),
+    GetAttachment(HttpRequestMetadata, Hash160),
+    GetAttachmentsInv(HttpRequestMetadata, StacksBlockId, HashSet<u32>),
+    GetIsTraitImplemented(
+        HttpRequestMetadata,
+        StacksAddress,
+        ContractName,
+        TraitIdentifier,
+        Option<StacksBlockId>,
+    ),
     /// catch-all for any errors we should surface from parsing
     ClientError(HttpRequestMetadata, ClientError),
 }
@@ -1278,6 +1353,7 @@ pub enum HttpResponseType {
     Microblocks(HttpResponseMetadata, Vec<StacksMicroblock>),
     MicroblockStream(HttpResponseMetadata),
     TransactionID(HttpResponseMetadata, Txid),
+    StacksBlockAccepted(HttpResponseMetadata, StacksBlockId, bool),
     MicroblockHash(HttpResponseMetadata, BlockHeaderHash),
     TokenTransferCost(HttpResponseMetadata, u64),
     GetMapEntry(HttpResponseMetadata, MapEntryResponse),
@@ -1285,6 +1361,10 @@ pub enum HttpResponseType {
     GetAccount(HttpResponseMetadata, AccountEntryResponse),
     GetContractABI(HttpResponseMetadata, ContractInterface),
     GetContractSrc(HttpResponseMetadata, ContractSrcResponse),
+    GetIsTraitImplemented(HttpResponseMetadata, GetIsTraitImplementedResponse),
+    UnconfirmedTransaction(HttpResponseMetadata, UnconfirmedTransactionResponse),
+    GetAttachment(HttpResponseMetadata, GetAttachmentResponse),
+    GetAttachmentsInv(HttpResponseMetadata, GetAttachmentsInvResponse),
     OptionsPreflight(HttpResponseMetadata),
     // peer-given error responses
     BadRequest(HttpResponseMetadata, String),
@@ -1411,25 +1491,15 @@ pub trait ProtocolFamily {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StacksP2P {}
 
-pub use self::http::StacksHttp;
-
 // an array in our protocol can't exceed this many items
 pub const ARRAY_MAX_LEN: u32 = u32::max_value();
 
 // maximum number of neighbors in a NeighborsData
 pub const MAX_NEIGHBORS_DATA_LEN: u32 = 128;
 
-// maximum number of relayers that can be included in a message
-pub const MAX_RELAYERS_LEN: u32 = 16;
-
 // number of peers to relay to, depending on outbound or inbound
 pub const MAX_BROADCAST_OUTBOUND_RECEIVERS: usize = 8;
 pub const MAX_BROADCAST_INBOUND_RECEIVERS: usize = 16;
-
-// messages can't be bigger than 16MB plus the preamble and relayers
-pub const MAX_PAYLOAD_LEN: u32 = 1 + 16 * 1024 * 1024;
-pub const MAX_MESSAGE_LEN: u32 =
-    MAX_PAYLOAD_LEN + (PREAMBLE_ENCODED_SIZE + MAX_RELAYERS_LEN * RELAY_DATA_ENCODED_SIZE);
 
 // maximum number of blocks that can be announced as available
 pub const BLOCKS_AVAILABLE_MAX_LEN: u32 = 32;
@@ -1445,25 +1515,6 @@ pub const GETPOXINV_MAX_BITLEN: u64 = 8;
 // message.
 pub const BLOCKS_PUSHED_MAX: u32 = 32;
 
-macro_rules! impl_byte_array_message_codec {
-    ($thing:ident, $len:expr) => {
-        impl ::net::StacksMessageCodec for $thing {
-            fn consensus_serialize<W: std::io::Write>(
-                &self,
-                fd: &mut W,
-            ) -> Result<(), ::net::Error> {
-                fd.write_all(self.as_bytes())
-                    .map_err(::net::Error::WriteError)
-            }
-            fn consensus_deserialize<R: std::io::Read>(fd: &mut R) -> Result<$thing, ::net::Error> {
-                let mut buf = [0u8; ($len as usize)];
-                fd.read_exact(&mut buf).map_err(::net::Error::ReadError)?;
-                let ret = $thing::from_bytes(&buf).expect("BUG: buffer is not the right size");
-                Ok(ret)
-            }
-        }
-    };
-}
 impl_byte_array_message_codec!(ConsensusHash, 20);
 impl_byte_array_message_codec!(Hash160, 20);
 impl_byte_array_message_codec!(BurnchainHeaderHash, 32);
@@ -1508,12 +1559,12 @@ impl PartialEq for NeighborKey {
 impl fmt::Display for NeighborKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let peer_version_str = if self.peer_version > 0 {
-            format!("{:08x}", self.peer_version).to_string()
+            format!("{:08x}", self.peer_version)
         } else {
             "UNKNOWN".to_string()
         };
         let network_id_str = if self.network_id > 0 {
-            format!("{:08x}", self.network_id).to_string()
+            format!("{:08x}", self.network_id)
         } else {
             "UNKNOWN".to_string()
         };
@@ -1582,8 +1633,18 @@ impl Neighbor {
         self.allowed < 0 || (self.allowed as u64) > get_epoch_time_secs()
     }
 
+    pub fn is_always_allowed(&self) -> bool {
+        self.allowed < 0
+    }
+
     pub fn is_denied(&self) -> bool {
         self.denied < 0 || (self.denied as u64) > get_epoch_time_secs()
+    }
+}
+
+impl fmt::Display for Neighbor {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}@{}", self.public_key.to_hex(), self.addr)
     }
 }
 
@@ -1610,13 +1671,20 @@ pub struct NetworkResult {
     pub pushed_blocks: HashMap<NeighborKey, Vec<BlocksData>>, // all blocks pushed to us
     pub pushed_microblocks: HashMap<NeighborKey, Vec<(Vec<RelayData>, MicroblocksData)>>, // all microblocks pushed to us, and the relay hints from the message
     pub uploaded_transactions: Vec<StacksTransaction>, // transactions sent to us by the http server
+    pub uploaded_blocks: Vec<BlocksData>,              // blocks sent to us via the http server
     pub uploaded_microblocks: Vec<MicroblocksData>,    // microblocks sent to us by the http server
+    pub attachments: Vec<(AttachmentInstance, Attachment)>,
     pub num_state_machine_passes: u64,
     pub num_inv_sync_passes: u64,
+    pub num_download_passes: u64,
 }
 
 impl NetworkResult {
-    pub fn new(num_state_machine_passes: u64, num_inv_sync_passes: u64) -> NetworkResult {
+    pub fn new(
+        num_state_machine_passes: u64,
+        num_inv_sync_passes: u64,
+        num_download_passes: u64,
+    ) -> NetworkResult {
         NetworkResult {
             unhandled_messages: HashMap::new(),
             download_pox_id: None,
@@ -1626,9 +1694,12 @@ impl NetworkResult {
             pushed_blocks: HashMap::new(),
             pushed_microblocks: HashMap::new(),
             uploaded_transactions: vec![],
+            uploaded_blocks: vec![],
             uploaded_microblocks: vec![],
+            attachments: vec![],
             num_state_machine_passes: num_state_machine_passes,
             num_inv_sync_passes: num_inv_sync_passes,
+            num_download_passes: num_download_passes,
         }
     }
 
@@ -1646,6 +1717,10 @@ impl NetworkResult {
         self.pushed_transactions.len() > 0 || self.uploaded_transactions.len() > 0
     }
 
+    pub fn has_attachments(&self) -> bool {
+        self.attachments.len() > 0
+    }
+
     pub fn transactions(&self) -> Vec<StacksTransaction> {
         self.pushed_transactions
             .values()
@@ -1655,7 +1730,10 @@ impl NetworkResult {
     }
 
     pub fn has_data_to_store(&self) -> bool {
-        self.has_blocks() || self.has_microblocks() || self.has_transactions()
+        self.has_blocks()
+            || self.has_microblocks()
+            || self.has_transactions()
+            || self.has_attachments()
     }
 
     pub fn consume_unsolicited(
@@ -1711,6 +1789,9 @@ impl NetworkResult {
                 StacksMessageType::Transaction(tx_data) => {
                     self.uploaded_transactions.push(tx_data);
                 }
+                StacksMessageType::Blocks(block_data) => {
+                    self.uploaded_blocks.push(block_data);
+                }
                 StacksMessageType::Microblocks(mblock_data) => {
                     self.uploaded_microblocks.push(mblock_data);
                 }
@@ -1723,10 +1804,55 @@ impl NetworkResult {
     }
 }
 
+pub trait Requestable: std::fmt::Display {
+    fn get_url(&self) -> &UrlString;
+
+    fn make_request_type(&self, peer_host: PeerHost) -> HttpRequestType;
+}
+
 #[cfg(test)]
 pub mod test {
-    use super::*;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::io;
+    use std::io::Cursor;
+    use std::io::ErrorKind;
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::*;
+    use std::ops::Deref;
+    use std::ops::DerefMut;
+    use std::sync::mpsc::sync_channel;
+    use std::thread;
+
+    use mio;
+    use rand;
+    use rand::RngCore;
+
+    use address::*;
+    use burnchains::bitcoin::address::*;
+    use burnchains::bitcoin::keys::*;
+    use burnchains::bitcoin::*;
+    use burnchains::burnchain::*;
+    use burnchains::db::BurnchainDB;
+    use burnchains::test::*;
+    use burnchains::*;
+    use chainstate::burn::db::sortdb;
+    use chainstate::burn::db::sortdb::*;
+    use chainstate::burn::operations::*;
+    use chainstate::burn::*;
+    use chainstate::coordinator::tests::*;
+    use chainstate::coordinator::*;
+    use chainstate::stacks::boot::*;
+    use chainstate::stacks::db::StacksChainState;
+    use chainstate::stacks::db::*;
+    use chainstate::stacks::miner::test::*;
+    use chainstate::stacks::miner::*;
+    use chainstate::stacks::*;
+    use chainstate::*;
+    use core::NETWORK_P2P_PORT;
     use net::asn::*;
+    use net::atlas::*;
     use net::chat::*;
     use net::codec::*;
     use net::connection::*;
@@ -1737,80 +1863,38 @@ pub mod test {
     use net::relay::*;
     use net::rpc::RPCHandlerArgs;
     use net::Error as net_error;
-
-    use core::NETWORK_P2P_PORT;
-
-    use chainstate::burn::db::sortdb;
-    use chainstate::burn::db::sortdb::*;
-    use chainstate::burn::operations::*;
-    use chainstate::burn::*;
-    use chainstate::stacks::boot::*;
-    use chainstate::stacks::db::*;
-    use chainstate::stacks::miner::test::*;
-    use chainstate::stacks::miner::*;
-    use chainstate::stacks::*;
-    use chainstate::*;
-
-    use chainstate::stacks::db::StacksChainState;
-
-    use chainstate::stacks::index::TrieHash;
-
-    use chainstate::coordinator::tests::*;
-    use chainstate::coordinator::*;
-
-    use burnchains::burnchain::*;
-    use burnchains::db::BurnchainDB;
-    use burnchains::test::*;
-    use burnchains::*;
-
-    use burnchains::bitcoin::address::*;
-    use burnchains::bitcoin::keys::*;
-    use burnchains::bitcoin::*;
-
     use util::get_epoch_time_secs;
     use util::hash::*;
     use util::secp256k1::*;
-    use util::uint::*;
-
-    use address::*;
-    use vm::costs::ExecutionCost;
-
-    use std::collections::HashMap;
-    use std::io;
-    use std::io::Cursor;
-    use std::io::ErrorKind;
-    use std::io::Read;
-    use std::io::Write;
-    use std::net::*;
-    use std::ops::Deref;
-    use std::ops::DerefMut;
-    use std::thread;
-
-    use std::fs;
-
-    use rand;
-    use rand::RngCore;
-
-    use mio;
-
     use util::strings::*;
+    use util::uint::*;
     use util::vrf::*;
-
+    use vm::costs::ExecutionCost;
     use vm::database::STXBalance;
     use vm::types::*;
 
+    use crate::codec::StacksMessageCodec;
+    use crate::types::chainstate::StacksMicroblockHeader;
+    use crate::types::proof::TrieHash;
+    use crate::util::boot::boot_code_test_addr;
+
+    use super::*;
+
     impl StacksMessageCodec for BlockstackOperationType {
-        fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), net_error> {
+        fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
             match self {
                 BlockstackOperationType::LeaderKeyRegister(ref op) => op.consensus_serialize(fd),
                 BlockstackOperationType::LeaderBlockCommit(ref op) => op.consensus_serialize(fd),
                 BlockstackOperationType::UserBurnSupport(ref op) => op.consensus_serialize(fd),
+                BlockstackOperationType::TransferStx(_)
+                | BlockstackOperationType::PreStx(_)
+                | BlockstackOperationType::StackStx(_) => Ok(()),
             }
         }
 
         fn consensus_deserialize<R: Read>(
             fd: &mut R,
-        ) -> Result<BlockstackOperationType, net_error> {
+        ) -> Result<BlockstackOperationType, codec_error> {
             panic!("not used");
         }
     }
@@ -2009,6 +2093,7 @@ pub mod test {
         pub data_url: UrlString,
         pub test_name: String,
         pub initial_balances: Vec<(PrincipalData, u64)>,
+        pub initial_lockups: Vec<ChainstateAccountLockup>,
         pub spending_account: TestMiner,
         pub setup_code: String,
     }
@@ -2024,14 +2109,16 @@ pub mod test {
                 )
                 .unwrap(),
             );
-            burnchain.pox_constants = PoxConstants::new(5, 3, 3, 25, 5);
+            burnchain.pox_constants =
+                PoxConstants::new(5, 3, 3, 25, 5, u64::max_value(), u64::max_value());
 
-            let spending_account = TestMinerFactory::new().next_miner(
+            let mut spending_account = TestMinerFactory::new().next_miner(
                 &burnchain,
                 1,
                 1,
                 AddressHashMode::SerializeP2PKH,
             );
+            spending_account.test_with_tx_fees = false; // manually set transaction fees
 
             TestPeerConfig {
                 network_id: 0x80000000,
@@ -2052,6 +2139,7 @@ pub mod test {
                 data_url: "".into(),
                 test_name: "".into(),
                 initial_balances: vec![],
+                initial_lockups: vec![],
                 spending_account: spending_account,
                 setup_code: "".into(),
             }
@@ -2162,9 +2250,13 @@ pub mod test {
             let mut miner =
                 miner_factory.next_miner(&config.burnchain, 1, 1, AddressHashMode::SerializeP2PKH);
 
-            let mut burnchain = get_burnchain(&test_path);
+            // manually set fees
+            miner.test_with_tx_fees = false;
+
+            let mut burnchain = get_burnchain(&test_path, None);
             burnchain.first_block_height = config.burnchain.first_block_height;
             burnchain.first_block_hash = config.burnchain.first_block_hash;
+            burnchain.pox_constants = config.burnchain.pox_constants;
 
             config.burnchain = burnchain.clone();
 
@@ -2177,17 +2269,20 @@ pub mod test {
             )
             .unwrap();
 
+            let first_burnchain_block_height = config.burnchain.first_block_height;
+            let first_burnchain_block_hash = config.burnchain.first_block_hash;
+
             let _burnchain_blocks_db = BurnchainDB::connect(
                 &config.burnchain.get_burnchaindb_path(),
-                config.burnchain.first_block_height,
-                &config.burnchain.first_block_hash,
+                first_burnchain_block_height,
+                &first_burnchain_block_hash,
                 0,
                 true,
             )
             .unwrap();
 
-            let chainstate_path = get_chainstate_path(&test_path);
-            let peerdb_path = format!("{}/peers.db", &test_path);
+            let chainstate_path = get_chainstate_path_str(&test_path);
+            let peerdb_path = format!("{}/peers.sqlite", &test_path);
 
             let mut peerdb = PeerDB::connect(
                 &peerdb_path,
@@ -2203,45 +2298,107 @@ pub mod test {
                 Some(&config.initial_neighbors),
             )
             .unwrap();
+            {
+                // bootstrap nodes *always* allowed
+                let mut tx = peerdb.tx_begin().unwrap();
+                for initial_neighbor in config.initial_neighbors.iter() {
+                    PeerDB::set_allow_peer(
+                        &mut tx,
+                        initial_neighbor.addr.network_id,
+                        &initial_neighbor.addr.addrbytes,
+                        initial_neighbor.addr.port,
+                        -1,
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+            }
 
-            let init_code = config.setup_code.clone();
-            let (chainstate, _) = StacksChainState::open_and_exec(false, config.network_id, &chainstate_path, Some(config.initial_balances.clone()),
-                |ref mut clarity_tx| {
-                    if init_code.len() > 0 {
-                        clarity_tx.connection().as_transaction(|clarity| {
-                            let boot_code_address = StacksAddress::from_string(&STACKS_BOOT_CODE_CONTRACT_ADDRESS.to_string()).unwrap();
-                            let boot_code_account = StacksAccount {
-                                principal: PrincipalData::Standard(StandardPrincipalData::from(boot_code_address.clone())),
-                                nonce: 0,
-                                stx_balance: STXBalance::zero(),
-                            };
-                            let boot_code_auth = TransactionAuth::Standard(TransactionSpendingCondition::Singlesig(SinglesigSpendingCondition {
-                                signer: boot_code_address.bytes.clone(),
+            let atlasdb_path = format!("{}/atlas.sqlite", &test_path);
+            let atlasdb =
+                AtlasDB::connect(AtlasConfig::default(false), &atlasdb_path, true).unwrap();
+
+            let conf = config.clone();
+            let post_flight_callback = move |clarity_tx: &mut ClarityTx| {
+                if conf.setup_code.len() > 0 {
+                    clarity_tx.connection().as_transaction(|clarity| {
+                        let boot_code_addr = boot_code_test_addr();
+                        let boot_code_account = StacksAccount {
+                            principal: boot_code_addr.to_account_principal(),
+                            nonce: 0,
+                            stx_balance: STXBalance::zero(),
+                        };
+
+                        let boot_code_auth = TransactionAuth::Standard(
+                            TransactionSpendingCondition::Singlesig(SinglesigSpendingCondition {
+                                signer: boot_code_addr.bytes.clone(),
                                 hash_mode: SinglesigHashMode::P2PKH,
                                 key_encoding: TransactionPublicKeyEncoding::Uncompressed,
                                 nonce: 0,
-                                fee_rate: 0,
-                                signature: MessageSignature::empty()
-                            }));
+                                tx_fee: 0,
+                                signature: MessageSignature::empty(),
+                            }),
+                        );
 
-                            debug!("Instantiate test-specific boot code contract '{}.{}' ({} bytes)...", &STACKS_BOOT_CODE_CONTRACT_ADDRESS, &config.test_name, init_code.len());
+                        debug!(
+                            "Instantiate test-specific boot code contract '{}.{}' ({} bytes)...",
+                            &boot_code_addr.to_string(),
+                            &conf.test_name,
+                            conf.setup_code.len()
+                        );
 
-                            let smart_contract = TransactionPayload::SmartContract(
-                                TransactionSmartContract {
-                                    name: ContractName::try_from(config.test_name.as_str()).expect("FATAL: invalid boot-code contract name"),
-                                    code_body: StacksString::from_str(&init_code).expect("FATAL: invalid boot code body"),
-                                }
-                            );
+                        let smart_contract =
+                            TransactionPayload::SmartContract(TransactionSmartContract {
+                                name: ContractName::try_from(conf.test_name.as_str())
+                                    .expect("FATAL: invalid boot-code contract name"),
+                                code_body: StacksString::from_str(&conf.setup_code)
+                                    .expect("FATAL: invalid boot code body"),
+                            });
 
-                            let boot_code_smart_contract = StacksTransaction::new(TransactionVersion::Testnet, boot_code_auth.clone(), smart_contract);
-                            StacksChainState::process_transaction_payload(clarity, &boot_code_smart_contract, &boot_code_account).unwrap();
-                        });
-                    }
-                },
-                ExecutionCost::max_value()).unwrap();
+                        let boot_code_smart_contract = StacksTransaction::new(
+                            TransactionVersion::Testnet,
+                            boot_code_auth.clone(),
+                            smart_contract,
+                        );
+                        StacksChainState::process_transaction_payload(
+                            clarity,
+                            &boot_code_smart_contract,
+                            &boot_code_account,
+                        )
+                        .unwrap();
+                    });
+                }
+            };
 
-            let mut coord =
-                ChainsCoordinator::test_new(&burnchain, &test_path, OnChainRewardSetProvider());
+            let mut boot_data = ChainStateBootData::new(
+                &config.burnchain,
+                config.initial_balances.clone(),
+                Some(Box::new(post_flight_callback)),
+            );
+
+            if !config.initial_lockups.is_empty() {
+                let lockups = config.initial_lockups.clone();
+                boot_data.get_bulk_initial_lockups =
+                    Some(Box::new(move || Box::new(lockups.into_iter().map(|e| e))));
+            }
+
+            let (chainstate, _) = StacksChainState::open_and_exec(
+                false,
+                config.network_id,
+                &chainstate_path,
+                Some(&mut boot_data),
+                ExecutionCost::max_value(),
+            )
+            .unwrap();
+
+            let (tx, _) = sync_channel(100000);
+            let mut coord = ChainsCoordinator::test_new(
+                &burnchain,
+                config.network_id,
+                &test_path,
+                OnChainRewardSetProvider(),
+                tx,
+            );
             coord.handle_new_burnchain_block().unwrap();
 
             let mut stacks_node = TestStacksNode::from_chainstate(chainstate);
@@ -2297,12 +2454,13 @@ pub mod test {
 
             let local_peer = PeerDB::get_local_peer(peerdb.conn()).unwrap();
             let burnchain_view = {
-                let ic = sortdb.index_conn();
-                let chaintip = SortitionDB::get_canonical_burn_chain_tip(&ic).unwrap();
-                ic.get_burnchain_view(&config.burnchain, &chaintip).unwrap()
+                let chaintip = SortitionDB::get_canonical_burn_chain_tip(&sortdb.conn()).unwrap();
+                SortitionDB::get_burnchain_view(&sortdb.conn(), &config.burnchain, &chaintip)
+                    .unwrap()
             };
             let mut peer_network = PeerNetwork::new(
                 peerdb,
+                atlasdb,
                 local_peer,
                 config.peer_version,
                 config.burnchain.clone(),
@@ -2331,10 +2489,14 @@ pub mod test {
             let local_peer = PeerDB::get_local_peer(self.network.peerdb.conn()).unwrap();
             let chain_view = match self.sortdb {
                 Some(ref mut sortdb) => {
-                    let ic = sortdb.index_conn();
-                    let chaintip = SortitionDB::get_canonical_burn_chain_tip(&ic).unwrap();
-                    ic.get_burnchain_view(&self.config.burnchain, &chaintip)
-                        .unwrap()
+                    let chaintip =
+                        SortitionDB::get_canonical_burn_chain_tip(sortdb.conn()).unwrap();
+                    SortitionDB::get_burnchain_view(
+                        &sortdb.conn(),
+                        &self.config.burnchain,
+                        &chaintip,
+                    )
+                    .unwrap()
                 }
                 None => panic!("Misconfigured peer: no sortdb"),
             };
@@ -2363,8 +2525,10 @@ pub mod test {
                 &mut mempool,
                 None,
                 false,
+                false,
                 10,
                 &RPCHandlerArgs::default(),
+                &mut HashSet::new(),
             );
 
             self.sortdb = Some(sortdb);
@@ -2385,8 +2549,10 @@ pub mod test {
                 &mut mempool,
                 Some(dns_client),
                 false,
+                false,
                 10,
                 &RPCHandlerArgs::default(),
+                &mut HashSet::new(),
             );
 
             self.sortdb = Some(sortdb);
@@ -2477,17 +2643,7 @@ pub mod test {
             bhh: &BurnchainHeaderHash,
         ) {
             for op in blockstack_ops.iter_mut() {
-                match op {
-                    BlockstackOperationType::LeaderKeyRegister(ref mut data) => {
-                        data.burn_header_hash = (*bhh).clone();
-                    }
-                    BlockstackOperationType::LeaderBlockCommit(ref mut data) => {
-                        data.burn_header_hash = (*bhh).clone();
-                    }
-                    BlockstackOperationType::UserBurnSupport(ref mut data) => {
-                        data.burn_header_hash = (*bhh).clone();
-                    }
-                }
+                op.set_burn_header_hash(bhh.clone());
             }
         }
 
@@ -2939,9 +3095,25 @@ pub mod test {
             ) {
                 Ok(recipients) => {
                     block_commit_op.commit_outs = match recipients {
-                        Some(info) => info.recipients.into_iter().map(|x| x.0).collect(),
+                        Some(info) => {
+                            let mut recipients = info
+                                .recipients
+                                .into_iter()
+                                .map(|x| x.0)
+                                .collect::<Vec<StacksAddress>>();
+                            if recipients.len() == 1 {
+                                recipients.push(StacksAddress::burn_address(false));
+                            }
+                            recipients
+                        }
                         None => vec![],
                     };
+                    test_debug!(
+                        "Block commit at height {} has {} recipients: {:?}",
+                        block_commit_op.block_height,
+                        block_commit_op.commit_outs.len(),
+                        &block_commit_op.commit_outs
+                    );
                 }
                 Err(e) => {
                     panic!("Failure fetching recipient set: {:?}", e);
@@ -3048,9 +3220,8 @@ pub mod test {
         pub fn get_burnchain_view(&mut self) -> Result<BurnchainView, db_error> {
             let sortdb = self.sortdb.take().unwrap();
             let view_res = {
-                let ic = sortdb.index_conn();
-                let chaintip = SortitionDB::get_canonical_burn_chain_tip(&ic).unwrap();
-                ic.get_burnchain_view(&self.config.burnchain, &chaintip)
+                let chaintip = SortitionDB::get_canonical_burn_chain_tip(&sortdb.conn()).unwrap();
+                SortitionDB::get_burnchain_view(&sortdb.conn(), &self.config.burnchain, &chaintip)
             };
             self.sortdb = Some(sortdb);
             view_res

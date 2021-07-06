@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -23,7 +23,7 @@ pub mod errors;
 pub mod stack_depth_checker;
 pub mod sugar_expander;
 pub mod types;
-use vm::costs::{cost_functions, CostTracker};
+use vm::costs::{cost_functions, runtime_cost, CostTracker, LimitedCostTracker};
 use vm::errors::{Error, RuntimeErrorType};
 
 use vm::representations::SymbolicExpression;
@@ -37,6 +37,7 @@ use self::sugar_expander::SugarExpander;
 use self::traits_resolver::TraitsResolver;
 use self::types::BuildASTPass;
 pub use self::types::ContractAST;
+use vm::costs::cost_functions::ClarityCostFunction;
 
 /// Legacy function
 pub fn parse(
@@ -52,10 +53,10 @@ pub fn build_ast<T: CostTracker>(
     source_code: &str,
     cost_track: &mut T,
 ) -> ParseResult<ContractAST> {
-    runtime_cost!(
-        cost_functions::AST_PARSE,
+    runtime_cost(
+        ClarityCostFunction::AstParse,
         cost_track,
-        source_code.len() as u64
+        source_code.len() as u64,
     )?;
     let pre_expressions = parser::parse(source_code)?;
     let mut contract_ast = ContractAST::new(contract_identifier.clone(), pre_expressions);
@@ -71,8 +72,13 @@ pub fn build_ast<T: CostTracker>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::chainstate::StacksBlockId;
+    use crate::types::proof::ClarityMarfTrieId;
+    use clarity_vm::clarity::ClarityInstance;
+    use clarity_vm::database::marf::MarfedKV;
     use std::collections::HashMap;
-    use vm::costs::LimitedCostTracker;
+    use vm::costs::*;
+    use vm::database::*;
     use vm::representations::depth_traverse;
 
     fn dependency_edge_counting_runtime(iters: usize) -> u64 {
@@ -85,7 +91,27 @@ mod tests {
             progn.push_str("))");
         }
 
-        let mut cost_track = LimitedCostTracker::new_max_limit();
+        let marf = MarfedKV::temporary();
+        let mut clarity_instance = ClarityInstance::new(false, marf, ExecutionCost::max_value());
+
+        clarity_instance
+            .begin_test_genesis_block(
+                &StacksBlockId::sentinel(),
+                &StacksBlockId([0 as u8; 32]),
+                &NULL_HEADER_DB,
+                &NULL_BURN_STATE_DB,
+            )
+            .commit_block();
+
+        let mut cost_track = clarity_instance
+            .begin_block(
+                &StacksBlockId([0 as u8; 32]),
+                &StacksBlockId([1 as u8; 32]),
+                &NULL_HEADER_DB,
+                &NULL_BURN_STATE_DB,
+            )
+            .commit_block();
+
         build_ast(
             &QualifiedContractIdentifier::transient(),
             &progn,
@@ -112,7 +138,7 @@ mod tests {
                        b: 1,
                        c: 3 }";
 
-        let mut cost_track = LimitedCostTracker::new_max_limit();
+        let mut cost_track = LimitedCostTracker::new_free();
         let ast = build_ast(
             &QualifiedContractIdentifier::transient(),
             &progn,

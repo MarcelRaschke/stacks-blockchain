@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -16,43 +16,34 @@
 
 use std::io::{Read, Write};
 
-use chainstate::burn::operations::Error as op_error;
-use chainstate::burn::ConsensusHash;
-use chainstate::burn::Opcodes;
-
-use chainstate::burn::operations::{
-    BlockstackOperation, BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp,
-    UserBurnSupportOp,
-};
-
-use util::db::DBConn;
-use util::db::DBTx;
-
-use chainstate::burn::db::sortdb::SortitionHandleTx;
-use chainstate::stacks::index::TrieHash;
-
+use crate::codec::{write_next, Error as codec_error, StacksMessageCodec};
+use crate::types::chainstate::StacksAddress;
+use crate::types::proof::TrieHash;
+use address::AddressHashMode;
 use burnchains::Address;
 use burnchains::Burnchain;
 use burnchains::BurnchainBlockHeader;
-use burnchains::BurnchainHeaderHash;
 use burnchains::BurnchainTransaction;
 use burnchains::PublicKey;
 use burnchains::Txid;
-
-use address::AddressHashMode;
-
-use chainstate::burn::BlockHeaderHash;
-use chainstate::stacks::StacksAddress;
+use chainstate::burn::db::sortdb::SortitionHandleTx;
+use chainstate::burn::operations::Error as op_error;
+use chainstate::burn::operations::{
+    BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp, UserBurnSupportOp,
+};
+use chainstate::burn::ConsensusHash;
+use chainstate::burn::Opcodes;
 use chainstate::stacks::StacksPrivateKey;
 use chainstate::stacks::StacksPublicKey;
-
-use net::codec::write_next;
 use net::Error as net_error;
-use net::StacksMessageCodec;
-
+use util::db::DBConn;
+use util::db::DBTx;
 use util::hash::DoubleSha256;
 use util::log;
 use util::vrf::{VRFPrivateKey, VRFPublicKey, VRF};
+
+use crate::types::chainstate::BlockHeaderHash;
+use crate::types::chainstate::BurnchainHeaderHash;
 
 struct ParsedData {
     pub consensus_hash: ConsensusHash,
@@ -73,7 +64,7 @@ impl LeaderKeyRegisterOp {
             txid: Txid([0u8; 32]),
             vtxindex: 0,
             block_height: 0,
-            burn_header_hash: BurnchainHeaderHash([0u8; 32]),
+            burn_header_hash: BurnchainHeaderHash::zero(),
         }
     }
 
@@ -110,7 +101,7 @@ impl LeaderKeyRegisterOp {
             0      2  3              23                       55                          80
             |------|--|---------------|-----------------------|---------------------------|
              magic  op consensus hash   proving public key               memo
-
+                       (ignored)                                       (ignored)
 
              Note that `data` is missing the first 3 bytes -- the magic and op have been stripped
         */
@@ -206,38 +197,41 @@ impl StacksMessageCodec for LeaderKeyRegisterOp {
         0      2  3              23                       55                          80
         |------|--|---------------|-----------------------|---------------------------|
          magic  op consensus hash    proving public key               memo
+                   (ignored)                                       (ignored)
     */
-    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), net_error> {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
         write_next(fd, &(Opcodes::LeaderKeyRegister as u8))?;
         write_next(fd, &self.consensus_hash)?;
         fd.write_all(&self.public_key.as_bytes()[..])
-            .map_err(net_error::WriteError)?;
+            .map_err(codec_error::WriteError)?;
 
         let memo = match self.memo.len() {
-            l if l <= 25 => self.memo[0..].to_vec().clone(),
-            _ => self.memo[0..25].to_vec().clone(),
+            l if l <= 25 => self.memo[0..].to_vec(),
+            _ => self.memo[0..25].to_vec(),
         };
-        fd.write_all(&memo).map_err(net_error::WriteError)?;
+        fd.write_all(&memo).map_err(codec_error::WriteError)?;
         Ok(())
     }
 
-    fn consensus_deserialize<R: Read>(_fd: &mut R) -> Result<LeaderKeyRegisterOp, net_error> {
+    fn consensus_deserialize<R: Read>(_fd: &mut R) -> Result<LeaderKeyRegisterOp, codec_error> {
         // Op deserialized through burchain indexer
         unimplemented!();
     }
 }
 
-impl BlockstackOperation for LeaderKeyRegisterOp {
-    fn from_tx(
+impl LeaderKeyRegisterOp {
+    pub fn from_tx(
         block_header: &BurnchainBlockHeader,
         tx: &BurnchainTransaction,
     ) -> Result<LeaderKeyRegisterOp, op_error> {
         LeaderKeyRegisterOp::parse_from_tx(block_header.block_height, &block_header.block_hash, tx)
     }
-}
 
-impl LeaderKeyRegisterOp {
-    pub fn check(&self, burnchain: &Burnchain, tx: &mut SortitionHandleTx) -> Result<(), op_error> {
+    pub fn check(
+        &self,
+        _burnchain: &Burnchain,
+        tx: &mut SortitionHandleTx,
+    ) -> Result<(), op_error> {
         /////////////////////////////////////////////////////////////////
         // Keys must be unique -- no one can register the same key twice
         /////////////////////////////////////////////////////////////////
@@ -253,50 +247,31 @@ impl LeaderKeyRegisterOp {
             return Err(op_error::LeaderKeyAlreadyRegistered);
         }
 
-        /////////////////////////////////////////////////////////////////
-        // Consensus hash must be recent and valid
-        /////////////////////////////////////////////////////////////////
-
-        let consensus_hash_recent = tx.is_fresh_consensus_hash(
-            burnchain.consensus_hash_lifetime.into(),
-            &self.consensus_hash,
-        )?;
-
-        if !consensus_hash_recent {
-            warn!(
-                "Invalid leader key registration: invalid consensus hash {}",
-                &self.consensus_hash
-            );
-            return Err(op_error::LeaderKeyBadConsensusHash);
-        }
-
         Ok(())
     }
 }
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
     use burnchains::bitcoin::address::BitcoinAddress;
     use burnchains::bitcoin::blocks::BitcoinBlockParser;
     use burnchains::bitcoin::keys::BitcoinPublicKey;
     use burnchains::bitcoin::BitcoinNetworkType;
     use burnchains::*;
-
+    use chainstate::burn::db::sortdb::*;
+    use chainstate::burn::operations::{
+        BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp, UserBurnSupportOp,
+    };
+    use chainstate::burn::{BlockSnapshot, ConsensusHash, OpsHash, SortitionHash};
     use deps::bitcoin::blockdata::transaction::Transaction;
     use deps::bitcoin::network::serialize::deserialize;
-
-    use chainstate::burn::{BlockSnapshot, ConsensusHash, OpsHash, SortitionHash};
-
-    use chainstate::burn::db::sortdb::*;
     use util::get_epoch_time_secs;
     use util::hash::{hex_bytes, to_hex};
     use util::log;
 
-    use chainstate::burn::operations::{
-        BlockstackOperation, BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp,
-        UserBurnSupportOp,
-    };
+    use crate::types::chainstate::SortitionId;
+
+    use super::*;
 
     pub struct OpFixture {
         pub txstr: String,
@@ -403,8 +378,8 @@ pub mod tests {
                 },
                 None => BurnchainBlockHeader {
                     block_height: 0,
-                    block_hash: BurnchainHeaderHash([0u8; 32]),
-                    parent_block_hash: BurnchainHeaderHash([0u8; 32]),
+                    block_hash: BurnchainHeaderHash::zero(),
+                    parent_block_hash: BurnchainHeaderHash::zero(),
                     num_txs: 0,
                     timestamp: get_epoch_time_secs(),
                 },
@@ -515,8 +490,10 @@ pub mod tests {
             working_dir: "/nope".to_string(),
             consensus_hash_lifetime: 24,
             stable_confirmations: 7,
-            first_block_height: first_block_height,
+            first_block_height,
+            initial_reward_start_block: first_block_height,
             first_block_hash: first_burn_hash.clone(),
+            first_block_timestamp: 0,
         };
 
         let mut db = SortitionDB::connect_test(first_block_height, &first_burn_hash).unwrap();
@@ -580,11 +557,13 @@ pub mod tests {
             let mut prev_snapshot = SortitionDB::get_first_block_snapshot(db.conn()).unwrap();
             for i in 0..10 {
                 let mut snapshot_row = BlockSnapshot {
+                    accumulated_coinbase_ustx: 0,
                     pox_valid: true,
                     block_height: i + 1 + first_block_height,
                     burn_header_timestamp: get_epoch_time_secs(),
                     burn_header_hash: block_header_hashes[i as usize].clone(),
                     sortition_id: SortitionId(block_header_hashes[i as usize].0.clone()),
+                    parent_sortition_id: prev_snapshot.sortition_id.clone(),
                     parent_burn_header_hash: prev_snapshot.burn_header_hash.clone(),
                     consensus_hash: ConsensusHash::from_bytes(&[
                         0,
@@ -642,6 +621,8 @@ pub mod tests {
                         &prev_snapshot,
                         &snapshot_row,
                         &block_ops[i as usize],
+                        &vec![],
+                        None,
                         None,
                         None,
                     )
@@ -691,43 +672,6 @@ pub mod tests {
                     burn_header_hash: block_123_hash.clone(),
                 },
                 res: Err(op_error::LeaderKeyAlreadyRegistered),
-            },
-            CheckFixture {
-                // reject -- invalid consensus hash
-                op: LeaderKeyRegisterOp {
-                    consensus_hash: ConsensusHash::from_bytes(
-                        &hex_bytes("1000000000000000000000000000000000000000").unwrap(),
-                    )
-                    .unwrap(),
-                    public_key: VRFPublicKey::from_bytes(
-                        &hex_bytes(
-                            "bb519494643f79f1dea0350e6fb9a1da88dfdb6137117fc2523824a8aa44fe1c",
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap(),
-                    memo: vec![01, 02, 03, 04, 05],
-                    address: StacksAddress::from_bitcoin_address(
-                        &BitcoinAddress::from_scriptpubkey(
-                            BitcoinNetworkType::Testnet,
-                            &hex_bytes("76a9140be3e286a15ea85882761618e366586b5574100d88ac")
-                                .unwrap(),
-                        )
-                        .unwrap(),
-                    ),
-
-                    txid: Txid::from_bytes_be(
-                        &hex_bytes(
-                            "1bfa831b5fc56c858198acb8e77e5863c1e9d8ac26d49ddb914e24d8d4083562",
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap(),
-                    vtxindex: 456,
-                    block_height: 123,
-                    burn_header_hash: block_123_hash.clone(),
-                },
-                res: Err(op_error::LeaderKeyBadConsensusHash),
             },
             CheckFixture {
                 // accept
@@ -787,6 +731,4 @@ pub mod tests {
             );
         }
     }
-
-    // TODO: make VRF keys expire
 }

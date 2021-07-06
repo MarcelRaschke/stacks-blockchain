@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -22,7 +22,7 @@ use std::{cmp, fmt};
 
 use address::c32;
 use util::hash;
-use vm::costs::{cost_functions, CostOverflowingMath};
+use vm::costs::{cost_functions, runtime_cost, CostOverflowingMath};
 use vm::errors::{CheckErrors, Error as VMError, IncomparableError, RuntimeErrorType};
 use vm::representations::{
     ClarityName, ContractName, SymbolicExpression, SymbolicExpressionType, TraitDefinition,
@@ -62,7 +62,7 @@ impl AssetIdentifier {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TupleTypeSignature {
     type_map: BTreeMap<ClarityName, TypeSignature>,
 }
@@ -389,7 +389,7 @@ impl TypeSignature {
         match self {
             SequenceType(SequenceSubtype::ListType(ref my_list_type)) => {
                 if let SequenceType(SequenceSubtype::ListType(other_list_type)) = other {
-                    if other_list_type.max_len <= 0 {
+                    if other_list_type.max_len == 0 {
                         // if other is an empty list, a list type should always admit.
                         true
                     } else if my_list_type.max_len >= other_list_type.max_len {
@@ -557,6 +557,10 @@ impl TupleTypeSignature {
             Err(CheckErrors::BadSyntaxExpectedListOfPairs)
         }
     }
+
+    pub fn shallow_merge(&mut self, update: &mut TupleTypeSignature) {
+        self.type_map.append(&mut update.type_map);
+    }
 }
 
 impl FixedFunction {
@@ -678,9 +682,6 @@ impl TypeSignature {
                 TupleType(TupleTypeSignature { type_map: types_a }),
                 TupleType(TupleTypeSignature { type_map: types_b }),
             ) => {
-                if types_a.len() != types_b.len() {
-                    return Err(CheckErrors::TypeError(a.clone(), b.clone()));
-                }
                 let mut type_map_out = BTreeMap::new();
                 for (name, entry_a) in types_a.iter() {
                     let entry_b = types_b
@@ -941,7 +942,7 @@ impl TypeSignature {
         x: &SymbolicExpression,
         accounting: &mut A,
     ) -> Result<TypeSignature> {
-        runtime_cost!(cost_functions::TYPE_PARSE_STEP, accounting, 0)?;
+        runtime_cost(ClarityCostFunction::TypeParseStep, accounting, 0)?;
 
         match x.expr {
             SymbolicExpressionType::Atom(ref atom_type_str) => {
@@ -1215,6 +1216,7 @@ impl TupleTypeSignature {
     }
 }
 
+use vm::costs::cost_functions::ClarityCostFunction;
 use vm::costs::CostTracker;
 
 pub fn parse_name_type_pairs<A: CostTracker>(
@@ -1266,6 +1268,16 @@ impl fmt::Display for TupleTypeSignature {
             write!(f, " ({} {})", &**field_name, field_type)?;
         }
         write!(f, ")")
+    }
+}
+
+impl fmt::Debug for TupleTypeSignature {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "TupleTypeSignature {{")?;
+        for (field_name, field_type) in self.type_map.iter() {
+            write!(f, " \"{}\": {},", &**field_name, field_type)?;
+        }
+        write!(f, "}}")
     }
 }
 

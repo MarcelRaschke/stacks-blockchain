@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,11 +14,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use crate::clarity_vm::database::MemoryBackingStore;
 use std::convert::TryInto;
 use vm::analysis::errors::CheckErrors;
 use vm::analysis::{mem_type_check, AnalysisDatabase};
 use vm::ast::parse;
-use vm::database::MemoryBackingStore;
 use vm::types::{QualifiedContractIdentifier, SequenceSubtype, StringSubtype, TypeSignature};
 
 fn string_ascii_type(size: u32) -> TypeSignature {
@@ -33,18 +33,22 @@ const FIRST_CLASS_TOKENS: &str = "(define-fungible-token stackaroos)
          (nft-get-owner? stacka-nfts \"1234567890\" )
          (define-read-only (my-ft-get-balance (account principal))
             (ft-get-balance stackaroos account))
+         (define-read-only (my-ft-get-supply)
+            (ft-get-supply stackaroos))
          (define-public (my-token-transfer (to principal) (amount uint))
             (ft-transfer? stackaroos amount tx-sender to))
          (define-public (faucet)
            (let ((original-sender tx-sender))
              (as-contract (ft-transfer? stackaroos u1 tx-sender original-sender))))
+         (define-public (burn)
+           (ft-burn? stackaroos u1 tx-sender))
          (define-public (mint-after (block-to-release uint))
            (if (>= block-height block-to-release)
                (faucet)
                (err u8)))
-         (begin (ft-mint? stackaroos u10000 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR)
-                (ft-mint? stackaroos u200 'SM2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQVX8X0G)
-                (ft-mint? stackaroos u4 .tokens))";
+         (begin (unwrap-panic (ft-mint? stackaroos u10000 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR))
+                (unwrap-panic (ft-mint? stackaroos u200 'SM2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQVX8X0G))
+                (unwrap-panic (ft-mint? stackaroos u4 .tokens)))";
 
 const ASSET_NAMES: &str = "(define-constant burn-address 'SP000000000000000000002Q6VF78)
          (define-private (price-function (name uint))
@@ -52,8 +56,8 @@ const ASSET_NAMES: &str = "(define-constant burn-address 'SP00000000000000000000
 
          (define-non-fungible-token names uint)
          (define-map preorder-map
-           ((name-hash (buff 20)))
-           ((buyer principal) (paid uint)))
+           { name-hash: (buff 20) }
+           { buyer: principal, paid: uint })
 
          (define-public (preorder
                         (name-hash (buff 20))
@@ -91,7 +95,10 @@ const ASSET_NAMES: &str = "(define-constant burn-address 'SP00000000000000000000
                       (tuple (name-hash (hash160 (xor name salt))))))
                     (ok u0)
                     (err u3))
-                  (err u4))))";
+                  (err u4))))
+          (define-public (revoke (name uint))
+            (nft-burn? names name tx-sender))
+         ";
 
 #[test]
 fn test_names_tokens_contracts() {
@@ -140,6 +147,9 @@ fn test_bad_asset_usage() {
         "(nft-transfer? stacka-nfts \"a\" u2 tx-sender)",
         "(nft-transfer? stacka-nfts \"a\" tx-sender u2)",
         "(nft-transfer? stacka-nfts u2 tx-sender tx-sender)",
+        "(nft-burn? u1234 \"a\" tx-sender)",
+        "(nft-burn? stacka-nfts u2 tx-sender)",
+        "(nft-burn? stacka-nfts \"a\" u2)",
         "(ft-transfer? stackoos u1 tx-sender tx-sender)",
         "(ft-transfer? u1234 u1 tx-sender tx-sender)",
         "(ft-transfer? stackaroos u2 u100 tx-sender)",
@@ -149,6 +159,10 @@ fn test_bad_asset_usage() {
         "(define-non-fungible-token stackaroos integer)",
         "(ft-mint? stackaroos 100 tx-sender)",
         "(ft-transfer? stackaroos 1 tx-sender tx-sender)",
+        "(ft-get-supply stackoos)",
+        "(ft-burn? stackoos u1 tx-sender)",
+        "(ft-burn? stackaroos 1 tx-sender)",
+        "(ft-burn? stackaroos u1 123432343)",
     ];
 
     let expected = [
@@ -175,6 +189,9 @@ fn test_bad_asset_usage() {
         CheckErrors::TypeError(TypeSignature::PrincipalType, TypeSignature::UIntType),
         CheckErrors::TypeError(TypeSignature::PrincipalType, TypeSignature::UIntType),
         CheckErrors::TypeError(string_ascii_type(10), TypeSignature::UIntType),
+        CheckErrors::BadTokenName,
+        CheckErrors::TypeError(string_ascii_type(10), TypeSignature::UIntType),
+        CheckErrors::TypeError(TypeSignature::PrincipalType, TypeSignature::UIntType),
         CheckErrors::NoSuchFT("stackoos".to_string()),
         CheckErrors::BadTokenName,
         CheckErrors::TypeError(TypeSignature::PrincipalType, TypeSignature::UIntType),
@@ -184,12 +201,16 @@ fn test_bad_asset_usage() {
         CheckErrors::DefineNFTBadSignature.into(),
         CheckErrors::TypeError(TypeSignature::UIntType, TypeSignature::IntType),
         CheckErrors::TypeError(TypeSignature::UIntType, TypeSignature::IntType),
+        CheckErrors::NoSuchFT("stackoos".to_string()),
+        CheckErrors::NoSuchFT("stackoos".to_string()),
+        CheckErrors::TypeError(TypeSignature::UIntType, TypeSignature::IntType),
+        CheckErrors::TypeError(TypeSignature::PrincipalType, TypeSignature::IntType),
     ];
 
     for (script, expected_err) in bad_scripts.iter().zip(expected.iter()) {
         let tokens_contract = format!("{}\n{}", FIRST_CLASS_TOKENS, script);
         let actual_err = mem_type_check(&tokens_contract).unwrap_err();
-
+        println!("{}", script);
         assert_eq!(&actual_err.err, expected_err);
     }
 }

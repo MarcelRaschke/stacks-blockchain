@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -15,12 +15,16 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::HashMap;
+
+use address::c32;
+use address::AddressHashMode;
+use chainstate::stacks::StacksPrivateKey;
+use chainstate::stacks::StacksPublicKey;
 use util::hash::{hex_bytes, to_hex};
 use vm::ast::parse;
 use vm::callables::DefinedFunction;
 use vm::contexts::OwnedEnvironment;
 use vm::costs::LimitedCostTracker;
-use vm::database::MemoryBackingStore;
 use vm::errors::{CheckErrors, Error, RuntimeErrorType, ShortReturnType};
 use vm::tests::execute;
 use vm::types::signatures::BufferLength;
@@ -29,10 +33,9 @@ use vm::types::{PrincipalData, ResponseData, SequenceData, SequenceSubtype};
 use vm::{eval, execute as vm_execute};
 use vm::{CallStack, ContractContext, Environment, GlobalContext, LocalContext, Value};
 
-use address::c32;
-use address::AddressHashMode;
-use chainstate::stacks::StacksPublicKey;
-use chainstate::stacks::{StacksAddress, StacksPrivateKey, C32_ADDRESS_VERSION_TESTNET_SINGLESIG};
+use crate::clarity_vm::database::MemoryBackingStore;
+use crate::types::chainstate::StacksAddress;
+use chainstate::stacks::C32_ADDRESS_VERSION_TESTNET_SINGLESIG;
 
 #[test]
 fn test_doubly_defined_persisted_vars() {
@@ -40,7 +43,7 @@ fn test_doubly_defined_persisted_vars() {
         "(define-non-fungible-token cursor uint) (define-non-fungible-token cursor uint)",
         "(define-fungible-token cursor) (define-fungible-token cursor)",
         "(define-data-var cursor int 0) (define-data-var cursor int 0)",
-        "(define-map cursor ((cursor int)) ((place uint))) (define-map cursor ((cursor int)) ((place uint)))" ];
+        "(define-map cursor { cursor: int } { place: uint }) (define-map cursor { cursor: int } { place: uint })" ];
     for p in tests.iter() {
         assert_eq!(
             vm_execute(p).unwrap_err(),
@@ -380,7 +383,7 @@ fn test_simple_if_functions() {
         let mut contract_context = ContractContext::new(QualifiedContractIdentifier::transient());
         let mut marf = MemoryBackingStore::new();
         let mut global_context =
-            GlobalContext::new(marf.as_clarity_db(), LimitedCostTracker::new_max_limit());
+            GlobalContext::new(false, marf.as_clarity_db(), LimitedCostTracker::new_free());
 
         contract_context
             .functions
@@ -477,6 +480,12 @@ fn test_simple_arithmetic_functions() {
         // from https://en.wikipedia.org/wiki/128-bit_computing
         "(sqrti 170141183460469231731687303715884105727)", // max i128
         "(sqrti u340282366920938463463374607431768211455)", // max u128
+        "(log2 u8)",
+        "(log2 u9)",
+        "(log2 8)",
+        "(log2 9)",
+        "(log2 170141183460469231731687303715884105727)", // max i128
+        "(log2 u340282366920938463463374607431768211455)", // max u128
         "(+ (pow u2 u127) (- (pow u2 u127) u1))",
         "(+ (to-uint 127) u10)",
         "(to-int (- (pow u2 u127) u1))",
@@ -510,6 +519,12 @@ fn test_simple_arithmetic_functions() {
         Value::Int(8),
         Value::Int(13_043_817_825_332_782_212),
         Value::UInt(18_446_744_073_709_551_615),
+        Value::UInt(3),
+        Value::UInt(3),
+        Value::Int(3),
+        Value::Int(3),
+        Value::Int(126),
+        Value::UInt(127),
         Value::UInt(u128::max_value()),
         Value::UInt(137),
         Value::Int(i128::max_value()),
@@ -540,6 +555,9 @@ fn test_simple_arithmetic_errors() {
         "(sqrti)",
         "(sqrti 256 16)",
         "(sqrti -1)",
+        "(log2)",
+        "(log2 8 9)",
+        "(log2 -8)",
         "(xor 1)",
         "(pow 2 (pow 2 32))",
         "(pow 2 (- 1))",
@@ -561,7 +579,10 @@ fn test_simple_arithmetic_errors() {
         CheckErrors::IncorrectArgumentCount(2, 1).into(),
         CheckErrors::IncorrectArgumentCount(1, 0).into(),
         CheckErrors::IncorrectArgumentCount(1, 2).into(),
-        RuntimeErrorType::Arithmetic("sqrti must be passed a positive number".to_string()).into(),
+        RuntimeErrorType::Arithmetic("sqrti must be passed a positive integer".to_string()).into(),
+        CheckErrors::IncorrectArgumentCount(1, 0).into(),
+        CheckErrors::IncorrectArgumentCount(1, 2).into(),
+        RuntimeErrorType::Arithmetic("log2 must be passed a positive integer".to_string()).into(),
         CheckErrors::IncorrectArgumentCount(2, 1).into(),
         RuntimeErrorType::Arithmetic(
             "Power argument to (pow ...) must be a u32 integer".to_string(),
@@ -909,6 +930,51 @@ fn test_lets() {
         .iter()
         .zip(expectations.iter())
         .for_each(|(program, expectation)| assert_eq!(expectation.clone(), execute(program)));
+}
+
+#[test]
+// tests that the type signature of the result of a merge tuple is updated.
+//  this is required to pass the type admission checks of, e.g., data store
+//  operations like `(define-data-var ...)`
+fn merge_update_type_signature_2239() {
+    let tests = [
+        "(define-data-var a {p: uint} (merge {p: 2} {p: u2})) (var-get a)",
+        "(merge {p: 2} {p: u2})",
+        "(merge {p: 2} {q: 3})",
+        "(define-data-var c {p: uint} {p: u2}) (var-get c)",
+        "(define-data-var d {p: uint} (merge {p: u2} {p: u2})) (var-get d)",
+        "(define-data-var e {p: int, q: int} {p: 2, q: 3}) (var-get e)",
+        "(define-data-var f {p: int, q: int} (merge {q: 2, p: 3} {p: 4})) (var-get f)",
+    ];
+
+    let expectations = [
+        "(tuple (p u2))",
+        "(tuple (p u2))",
+        "(tuple (p 2) (q 3))",
+        "(tuple (p u2))",
+        "(tuple (p u2))",
+        "(tuple (p 2) (q 3))",
+        "(tuple (p 4) (q 2))",
+    ];
+
+    tests
+        .iter()
+        .zip(expectations.iter())
+        .for_each(|(program, expectation)| {
+            assert_eq!(expectation.to_string(), execute(program).to_string())
+        });
+}
+
+#[test]
+fn test_2053_stacked_user_funcs() {
+    let test = "
+(define-read-only (identity (n int)) n)
+(begin (identity (identity 1)))
+";
+
+    let expectation = Value::Int(1);
+
+    assert_eq!(expectation, execute(test));
 }
 
 #[test]

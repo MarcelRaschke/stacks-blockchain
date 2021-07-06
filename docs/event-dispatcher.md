@@ -36,6 +36,7 @@ Example:
   "burn_block_time": 1591301733,
   "events": [
     {
+      "event_index": 1,
       "committed": true,
       "stx_transfer_event": {
         "amount": "1000",
@@ -72,8 +73,7 @@ Example:
     {
       "recipient": "ST31DA6FTSJX2WGTZ69SFY11BH51NZMB0ZZ239N96",
       "coinbase_amount": "1000",
-      "tx_fees_anchored_shared": "800",
-      "tx_fees_anchored_exclusive": "0",
+      "tx_fees_anchored": "800",
       "tx_fees_streamed_confirmed": "0",
       "from_stacks_block_hash": "0xf5d4ce0efe1d42c963d615ce57f0d014f263a985175e4ece766eceff10e0a358",
       "from_index_block_hash": "0x329efcbcc6daf5ac3f264522e0df50eddb5be85df6ee8a9fc2384c54274d7afc",
@@ -93,15 +93,28 @@ Example:
 ```json
 {
   "burn_block_hash": "0x4eaabcd105865e471f697eff5dd5bd85d47ecb5a26a3379d74fae0ae87c40904",
+  "burn_block_height": 331,
   "reward_recipients": [
     {
       "recipient": "1C56LYirKa3PFXFsvhSESgDy2acEHVAEt6",
-      "amount": 5000
+      "amt": 5000
     }
+  ],
+  "reward_slot_holders": [
+    "1C56LYirKa3PFXFsvhSESgDy2acEHVAEt6",
+    "1C56LYirKa3PFXFsvhSESgDy2acEHVAEt6"
   ],
   "burn_amount": 12000
 }
 ```
+
+* `reward_recipients` is an array of all the rewards received during this burn block. It may
+  include recipients who did _not_ have reward slots during the block. This could happen if
+  a miner's commitment was included a block or two later than intended. Such commitments would
+  not be valid, but the reward recipient would still receive the burn `amt`.
+* `reward_slot_holders` is an array of the Bitcoin addresses that would validly receive
+  PoX commitments during this block. These addresses may not actually receive rewards during
+  this block if the block is faster than miners have an opportunity to commit.
 
 ### `POST /new_mempool_tx`
 
@@ -115,3 +128,25 @@ Example:
   "0x80800000000400f942874ce525e87f21bbe8c121b12fac831d02f4000000000000000000000000000003e800006ae29867aec4b0e4f776bebdcea7f6d9a24eeff370c8c739defadfcbb52659b30736ad4af021e8fb741520a6c65da419fdec01989fdf0032fc1838f427a9a36102010000000000051ac2d519faccba2e435f3272ff042b89435fd160ff00000000000003e800000000000000000000000000000000000000000000000000000000000000000000"
 ]
 ```
+
+
+### `POST /drop_mempool_tx`
+
+This payload includes raw transactions newly received in the
+node's mempool.
+
+Example:
+
+```json
+{
+  "dropped_txids": ["d7b667bb93898b1d3eba4fee86617b06b95772b192f3643256dd0821b476e36f"],
+  "reason": "ReplaceByFee"
+}
+```
+
+Reason can be one of:
+
+* `ReplaceByFee` - replaced by a transaction with the same nonce, but a higher fee
+* `ReplaceAcrossFork` - replaced by a transaction with the same nonce but in the canonical fork
+* `TooExpensive` - the transaction is too expensive to include in a block
+* `StaleGarbageCollect` - transaction was dropped because it became stale

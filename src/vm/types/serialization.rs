@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,6 +14,16 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::borrow::Borrow;
+use std::collections::HashMap;
+use std::convert::{TryFrom, TryInto};
+use std::io::{Read, Write};
+use std::{error, fmt, str};
+
+use serde_json::Value as JSONValue;
+
+use util::hash::{hex_bytes, to_hex};
+use util::retry::BoundReader;
 use vm::database::{ClarityDeserializable, ClaritySerializable};
 use vm::errors::{
     CheckErrors, Error as ClarityError, IncomparableError, InterpreterError, InterpreterResult,
@@ -26,17 +36,7 @@ use vm::types::{
     TupleData, TypeSignature, Value, BOUND_VALUE_SERIALIZATION_BYTES, MAX_VALUE_SIZE,
 };
 
-use net::{Error as NetError, StacksMessageCodec};
-
-use serde_json::Value as JSONValue;
-use std::borrow::Borrow;
-use std::collections::HashMap;
-use std::convert::{TryFrom, TryInto};
-use util::hash::{hex_bytes, to_hex};
-use util::retry::BoundReader;
-
-use std::io::{Read, Write};
-use std::{error, fmt, str};
+use crate::codec::{Error as codec_error, StacksMessageCodec};
 
 /// Errors that may occur in serialization or deserialization
 /// If deserialization failed because the described type is a bad type and
@@ -261,14 +261,14 @@ impl PrincipalData {
 }
 
 impl StacksMessageCodec for PrincipalData {
-    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), NetError> {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
         self.inner_consensus_serialize(fd)
-            .map_err(NetError::WriteError)
+            .map_err(codec_error::WriteError)
     }
 
-    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<PrincipalData, NetError> {
+    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<PrincipalData, codec_error> {
         PrincipalData::inner_consensus_deserialize(fd)
-            .map_err(|e| NetError::DeserializeError(e.to_string()))
+            .map_err(|e| codec_error::DeserializeError(e.to_string()))
     }
 }
 
@@ -342,8 +342,7 @@ impl Value {
 
                 r.read_exact(&mut data[..])?;
 
-                // can safely unwrap, because the buffer length was _already_ checked.
-                Ok(Value::buff_from(data).unwrap())
+                Value::buff_from(data).map_err(|_| "Bad buffer".into())
             }
             TypePrefix::BoolTrue => {
                 check_match!(expected_type, TypeSignature::BoolType)?;
@@ -517,8 +516,7 @@ impl Value {
 
                 r.read_exact(&mut data[..])?;
 
-                // can safely unwrap, because the string length was _already_ checked.
-                Ok(Value::string_ascii_from_bytes(data).unwrap())
+                Value::string_ascii_from_bytes(data).map_err(|_| "Bad string".into())
             }
             TypePrefix::StringUTF8 => {
                 let mut total_len = [0; 4];
@@ -667,12 +665,14 @@ impl ClarityDeserializable<Value> for Value {
 
 #[cfg(test)]
 mod tests {
-    use super::super::*;
-    use super::SerializationError;
     use std::io::Write;
+
     use vm::database::ClaritySerializable;
     use vm::errors::Error;
     use vm::types::TypeSignature::{BoolType, IntType};
+
+    use super::super::*;
+    use super::SerializationError;
 
     fn buff_type(size: u32) -> TypeSignature {
         TypeSignature::SequenceType(SequenceSubtype::BufferType(size.try_into().unwrap())).into()

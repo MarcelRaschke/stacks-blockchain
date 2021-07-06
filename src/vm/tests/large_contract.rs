@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,19 +14,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use chainstate::burn::BlockHeaderHash;
+use crate::types::chainstate::BlockHeaderHash;
+use crate::types::chainstate::StacksBlockId;
+use crate::types::proof::ClarityMarfTrieId;
 use chainstate::stacks::index::storage::TrieFileStorage;
-use chainstate::stacks::index::MarfTrieId;
-use chainstate::stacks::StacksBlockId;
+use clarity_vm::clarity::{ClarityInstance, Error as ClarityError};
 use util::hash::hex_bytes;
 use vm::ast;
-use vm::clarity::{ClarityInstance, Error as ClarityError};
 use vm::contexts::{Environment, GlobalContext, OwnedEnvironment};
 use vm::contracts::Contract;
 use vm::costs::ExecutionCost;
-use vm::database::{
-    ClarityDatabase, MarfedKV, MemoryBackingStore, NULL_BURN_STATE_DB, NULL_HEADER_DB,
-};
+use vm::database::{ClarityDatabase, NULL_BURN_STATE_DB, NULL_HEADER_DB};
 use vm::errors::{CheckErrors, Error, RuntimeErrorType};
 use vm::execute as vm_execute;
 use vm::representations::SymbolicExpression;
@@ -35,6 +33,9 @@ use vm::types::{
     OptionalData, PrincipalData, QualifiedContractIdentifier, ResponseData, StandardPrincipalData,
     TypeSignature, Value,
 };
+
+use crate::clarity_vm::database::marf::MarfedKV;
+use crate::clarity_vm::database::MemoryBackingStore;
 
 /*
  * This test exhibits memory inflation --
@@ -45,15 +46,23 @@ use vm::types::{
 #[ignore]
 pub fn rollback_log_memory_test() {
     let marf = MarfedKV::temporary();
-    let mut clarity_instance = ClarityInstance::new(marf, ExecutionCost::max_value());
+    let mut clarity_instance = ClarityInstance::new(false, marf, ExecutionCost::max_value());
     let EXPLODE_N = 100;
 
     let contract_identifier = QualifiedContractIdentifier::local("foo").unwrap();
+    clarity_instance
+        .begin_test_genesis_block(
+            &StacksBlockId::sentinel(),
+            &StacksBlockId([0 as u8; 32]),
+            &NULL_HEADER_DB,
+            &NULL_BURN_STATE_DB,
+        )
+        .commit_block();
 
     {
         let mut conn = clarity_instance.begin_block(
-            &StacksBlockId::sentinel(),
             &StacksBlockId([0 as u8; 32]),
+            &StacksBlockId([1 as u8; 32]),
             &NULL_HEADER_DB,
             &NULL_BURN_STATE_DB,
         );
@@ -97,15 +106,24 @@ pub fn rollback_log_memory_test() {
 #[test]
 pub fn let_memory_test() {
     let marf = MarfedKV::temporary();
-    let mut clarity_instance = ClarityInstance::new(marf, ExecutionCost::max_value());
+    let mut clarity_instance = ClarityInstance::new(false, marf, ExecutionCost::max_value());
     let EXPLODE_N = 100;
 
     let contract_identifier = QualifiedContractIdentifier::local("foo").unwrap();
 
-    {
-        let mut conn = clarity_instance.begin_block(
+    clarity_instance
+        .begin_test_genesis_block(
             &StacksBlockId::sentinel(),
             &StacksBlockId([0 as u8; 32]),
+            &NULL_HEADER_DB,
+            &NULL_BURN_STATE_DB,
+        )
+        .commit_block();
+
+    {
+        let mut conn = clarity_instance.begin_block(
+            &StacksBlockId([0 as u8; 32]),
+            &StacksBlockId([1 as u8; 32]),
             &NULL_HEADER_DB,
             &NULL_BURN_STATE_DB,
         );
@@ -152,15 +170,24 @@ pub fn let_memory_test() {
 #[test]
 pub fn argument_memory_test() {
     let marf = MarfedKV::temporary();
-    let mut clarity_instance = ClarityInstance::new(marf, ExecutionCost::max_value());
+    let mut clarity_instance = ClarityInstance::new(false, marf, ExecutionCost::max_value());
     let EXPLODE_N = 100;
 
     let contract_identifier = QualifiedContractIdentifier::local("foo").unwrap();
 
-    {
-        let mut conn = clarity_instance.begin_block(
+    clarity_instance
+        .begin_test_genesis_block(
             &StacksBlockId::sentinel(),
             &StacksBlockId([0 as u8; 32]),
+            &NULL_HEADER_DB,
+            &NULL_BURN_STATE_DB,
+        )
+        .commit_block();
+
+    {
+        let mut conn = clarity_instance.begin_block(
+            &StacksBlockId([0 as u8; 32]),
+            &StacksBlockId([1 as u8; 32]),
             &NULL_HEADER_DB,
             &NULL_BURN_STATE_DB,
         );
@@ -207,16 +234,25 @@ pub fn argument_memory_test() {
 #[test]
 pub fn fcall_memory_test() {
     let marf = MarfedKV::temporary();
-    let mut clarity_instance = ClarityInstance::new(marf, ExecutionCost::max_value());
+    let mut clarity_instance = ClarityInstance::new(false, marf, ExecutionCost::max_value());
     let COUNT_PER_FUNC = 10;
     let FUNCS = 10;
 
     let contract_identifier = QualifiedContractIdentifier::local("foo").unwrap();
 
-    {
-        let mut conn = clarity_instance.begin_block(
+    clarity_instance
+        .begin_test_genesis_block(
             &StacksBlockId::sentinel(),
             &StacksBlockId([0 as u8; 32]),
+            &NULL_HEADER_DB,
+            &NULL_BURN_STATE_DB,
+        )
+        .commit_block();
+
+    {
+        let mut conn = clarity_instance.begin_block(
+            &StacksBlockId([0 as u8; 32]),
+            &StacksBlockId([1 as u8; 32]),
             &NULL_HEADER_DB,
             &NULL_BURN_STATE_DB,
         );
@@ -304,14 +340,23 @@ pub fn fcall_memory_test() {
 #[ignore]
 pub fn ccall_memory_test() {
     let marf = MarfedKV::temporary();
-    let mut clarity_instance = ClarityInstance::new(marf, ExecutionCost::max_value());
+    let mut clarity_instance = ClarityInstance::new(false, marf, ExecutionCost::max_value());
     let COUNT_PER_CONTRACT = 20;
     let CONTRACTS = 5;
 
-    {
-        let mut conn = clarity_instance.begin_block(
+    clarity_instance
+        .begin_test_genesis_block(
             &StacksBlockId::sentinel(),
             &StacksBlockId([0 as u8; 32]),
+            &NULL_HEADER_DB,
+            &NULL_BURN_STATE_DB,
+        )
+        .commit_block();
+
+    {
+        let mut conn = clarity_instance.begin_block(
+            &StacksBlockId([0 as u8; 32]),
+            &StacksBlockId([1 as u8; 32]),
             &NULL_HEADER_DB,
             &NULL_BURN_STATE_DB,
         );

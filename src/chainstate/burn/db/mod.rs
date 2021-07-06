@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,35 +14,31 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-pub mod processing;
-pub mod sortdb;
-
 use std::error;
 use std::fmt;
 
+use rusqlite::Connection;
 use rusqlite::Error as sqlite_error;
 use rusqlite::Row;
-
-use rusqlite::Connection;
-pub type DBConn = Connection;
-
 use serde_json::Error as serde_error;
 
-use burnchains::{Address, BurnchainHeaderHash, Txid};
-
-use util::hash::{hex_bytes, Hash160, Sha512Trunc256Sum};
-use util::vrf::*;
-
-use chainstate::burn::{BlockHeaderHash, ConsensusHash, OpsHash, SortitionHash, VRFSeed};
-
+use crate::types::proof::TrieHash;
+use burnchains::{Address, Txid};
+use chainstate::burn::{ConsensusHash, OpsHash, SortitionHash};
+use chainstate::stacks::StacksPublicKey;
 use util::db;
 use util::db::Error as db_error;
 use util::db::FromColumn;
-
-use chainstate::stacks::index::TrieHash;
-use chainstate::stacks::StacksPublicKey;
-
+use util::hash::{hex_bytes, Hash160, Sha512Trunc256Sum};
 use util::secp256k1::MessageSignature;
+use util::vrf::*;
+
+use crate::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, VRFSeed};
+
+pub mod processing;
+pub mod sortdb;
+
+pub type DBConn = Connection;
 
 impl_byte_array_from_column!(Txid);
 impl_byte_array_from_column!(ConsensusHash);
@@ -59,7 +55,7 @@ impl_byte_array_from_column!(MessageSignature);
 
 impl FromColumn<VRFPublicKey> for VRFPublicKey {
     fn from_column<'a>(row: &'a Row, column_name: &str) -> Result<VRFPublicKey, db_error> {
-        let pubkey_hex: String = row.get(column_name);
+        let pubkey_hex: String = row.get_unwrap(column_name);
         match VRFPublicKey::from_hex(&pubkey_hex) {
             Some(pubk) => Ok(pubk),
             None => Err(db_error::ParseError),
@@ -69,7 +65,7 @@ impl FromColumn<VRFPublicKey> for VRFPublicKey {
 
 impl<A: Address> FromColumn<A> for A {
     fn from_column<'a>(row: &'a Row, column_name: &str) -> Result<A, db_error> {
-        let address_str: String = row.get(column_name);
+        let address_str: String = row.get_unwrap(column_name);
         match A::from_string(&address_str) {
             Some(a) => Ok(a),
             None => Err(db_error::ParseError),

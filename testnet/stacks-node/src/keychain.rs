@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 
-use super::operations::BurnchainOpSigner;
-
 use stacks::address::AddressHashMode;
 use stacks::burnchains::{BurnchainSigner, PrivateKey};
 use stacks::chainstate::stacks::{
-    StacksAddress, StacksPrivateKey, StacksPublicKey, StacksTransactionSigner, TransactionAuth,
+    StacksPrivateKey, StacksPublicKey, StacksTransactionSigner, TransactionAuth,
 };
-use stacks::util::hash::Sha256Sum;
+use stacks::types::chainstate::StacksAddress;
+use stacks::util::hash::{Hash160, Sha256Sum};
 use stacks::util::vrf::{VRFPrivateKey, VRFProof, VRFPublicKey, VRF};
+
+use super::operations::BurnchainOpSigner;
 
 #[derive(Clone)]
 pub struct Keychain {
@@ -71,13 +72,8 @@ impl Keychain {
     }
 
     pub fn rotate_vrf_keypair(&mut self, block_height: u64) -> VRFPublicKey {
-        self.rotations = self
-            .rotations
-            .checked_add(1)
-            .expect("Exhausted VRF keypairs"); // this would require quite the hash power...
         let mut seed = {
             let mut secret_state = self.hashed_secret_state.to_bytes().to_vec();
-            secret_state.extend_from_slice(&self.rotations.to_be_bytes());
             secret_state.extend_from_slice(&block_height.to_be_bytes());
             Sha256Sum::from_data(&secret_state)
         };
@@ -97,13 +93,17 @@ impl Keychain {
         pk
     }
 
-    pub fn rotate_microblock_keypair(&mut self) -> StacksPrivateKey {
-        let mut seed = match self.microblocks_secret_keys.last() {
+    pub fn rotate_microblock_keypair(&mut self, burn_block_height: u64) -> StacksPrivateKey {
+        let mut secret_state = match self.microblocks_secret_keys.last() {
             // First key is the hash of the secret state
-            None => self.hashed_secret_state,
+            None => self.hashed_secret_state.to_bytes().to_vec(),
             // Next key is the hash of the last
-            Some(last_sk) => Sha256Sum::from_data(&last_sk.to_bytes()[..]),
+            Some(last_sk) => last_sk.to_bytes().to_vec(),
         };
+
+        secret_state.extend_from_slice(&burn_block_height.to_be_bytes());
+
+        let mut seed = Sha256Sum::from_data(&secret_state);
 
         // Not every 256-bit number is a valid secp256k1 secret key.
         // As such, we continuously generate seeds through re-hashing until one works.
@@ -115,6 +115,10 @@ impl Keychain {
         };
         sk.set_compress_public(true);
         self.microblocks_secret_keys.push(sk.clone());
+
+        debug!("Microblock keypair rotated";
+               "burn_block_height" => %burn_block_height,
+               "pubkey_hash" => %Hash160::from_node_public_key(&StacksPublicKey::from_private(&sk)).to_string(),);
 
         sk
     }
@@ -158,15 +162,19 @@ impl Keychain {
     }
 
     /// Given the keychain's secret keys, computes and returns the corresponding Stack address.
-    /// Note: Testnet bit is hardcoded.
-    pub fn get_address(&self) -> StacksAddress {
+    pub fn get_address(&self, is_mainnet: bool) -> StacksAddress {
         let public_keys = self
             .secret_keys
             .iter()
             .map(|ref pk| StacksPublicKey::from_private(pk))
             .collect();
+        let version = if is_mainnet {
+            self.hash_mode.to_version_mainnet()
+        } else {
+            self.hash_mode.to_version_testnet()
+        };
         StacksAddress::from_public_keys(
-            self.hash_mode.to_version_testnet(),
+            version,
             &self.hash_mode,
             self.threshold as usize,
             &public_keys,
@@ -174,9 +182,17 @@ impl Keychain {
         .unwrap()
     }
 
-    pub fn address_from_burnchain_signer(signer: &BurnchainSigner) -> StacksAddress {
+    pub fn address_from_burnchain_signer(
+        signer: &BurnchainSigner,
+        is_mainnet: bool,
+    ) -> StacksAddress {
+        let version = if is_mainnet {
+            signer.hash_mode.to_version_mainnet()
+        } else {
+            signer.hash_mode.to_version_testnet()
+        };
         StacksAddress::from_public_keys(
-            signer.hash_mode.to_version_testnet(),
+            version,
             &signer.hash_mode,
             signer.num_sigs,
             &signer.public_keys,
@@ -210,10 +226,16 @@ impl Keychain {
         }
     }
 
-    pub fn origin_address(&self) -> Option<StacksAddress> {
+    pub fn origin_address(&self, is_mainnet: bool) -> Option<StacksAddress> {
         match self.get_transaction_auth() {
-            // Note: testnet hard-coded
-            Some(auth) => Some(auth.origin().address_testnet()),
+            Some(auth) => {
+                let address = if is_mainnet {
+                    auth.origin().address_mainnet()
+                } else {
+                    auth.origin().address_testnet()
+                };
+                Some(address)
+            }
             None => None,
         }
     }

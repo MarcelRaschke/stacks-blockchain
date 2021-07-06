@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,10 +14,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use burnchains::BurnchainBlock;
 use burnchains::Error as burnchain_error;
 use burnchains::*;
 
-use burnchains::BurnchainBlock;
+use crate::types::chainstate::BurnchainHeaderHash;
 
 // IPC messages between threads
 pub trait BurnHeaderIPC {
@@ -56,7 +57,11 @@ pub trait BurnchainBlockParser {
 pub trait BurnchainIndexer {
     type P: BurnchainBlockParser + Send + Sync;
 
-    fn init(working_dir: &String, network_name: &String) -> Result<Self, burnchain_error>
+    fn init(
+        working_dir: &String,
+        network_name: &String,
+        first_block_height: u64,
+    ) -> Result<Self, burnchain_error>
     where
         Self: Sized;
     fn connect(&mut self) -> Result<(), burnchain_error>;
@@ -67,6 +72,7 @@ pub trait BurnchainIndexer {
 
     fn get_headers_path(&self) -> String;
     fn get_headers_height(&self) -> Result<u64, burnchain_error>;
+    fn get_highest_header_height(&self) -> Result<u64, burnchain_error>;
     fn find_chain_reorg(&mut self) -> Result<u64, burnchain_error>;
     fn sync_headers(
         &mut self,

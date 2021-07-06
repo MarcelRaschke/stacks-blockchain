@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -22,7 +22,7 @@ use vm::ast::types::{BuildASTPass, ContractAST, PreExpressionsDrain};
 use vm::functions::define::{DefineFunctions, DefineFunctionsParsed};
 use vm::functions::NativeFunctions;
 use vm::representations::PreSymbolicExpressionType::{
-    Atom, AtomValue, FieldIdentifier, List, SugaredFieldIdentifier, TraitReference,
+    Atom, AtomValue, FieldIdentifier, List, SugaredFieldIdentifier, TraitReference, Tuple,
 };
 use vm::representations::{
     ClarityName, PreSymbolicExpression, SymbolicExpression, TraitDefinition,
@@ -200,6 +200,9 @@ impl TraitsResolver {
                     } else {
                         return Err(ParseErrors::TraitReferenceNotAllowed.into());
                     }
+                }
+                Tuple(atoms) => {
+                    self.probe_for_generics(&atoms, referenced_traits, should_reference)?;
                 }
                 _ => { /* no-op */ }
             }

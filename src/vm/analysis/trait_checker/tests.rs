@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,13 +14,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use crate::clarity_vm::database::MemoryBackingStore;
 use vm::analysis::errors::CheckErrors;
 use vm::analysis::mem_type_check;
 use vm::analysis::type_check;
 use vm::analysis::{contract_interface_builder::build_contract_interface, AnalysisDatabase};
 use vm::ast::errors::ParseErrors;
 use vm::ast::{build_ast, parse};
-use vm::database::MemoryBackingStore;
 use vm::types::{QualifiedContractIdentifier, TypeSignature};
 
 #[test]
@@ -286,7 +286,7 @@ fn test_dynamic_dispatch_by_defining_and_impl_trait() {
 fn test_define_map_storing_trait_references() {
     let dispatching_contract_src = "(define-trait trait-1 (
             (get-1 (uint) (response uint uint))))
-        (define-map kv-store ((key uint)) ((value <trait-1>)))";
+        (define-map kv-store { key: uint } { value: <trait-1> })";
 
     let dispatching_contract_id =
         QualifiedContractIdentifier::local("dispatching-contract").unwrap();
@@ -1199,7 +1199,7 @@ fn test_return_trait_with_contract_of() {
             (get-1 (uint) (response uint uint))))
         (define-public (wrapped-get-1 (contract <trait-1>))
             (begin
-                (contract-call? contract get-1 u0)
+                (unwrap-panic (contract-call? contract get-1 u0))
                 (ok (contract-of contract))))";
     let target_contract_src = "(define-public (get-1 (x uint)) (ok u1))";
 
@@ -1231,7 +1231,7 @@ fn test_return_trait_with_contract_of_wrapped_in_begin() {
             (get-1 (uint) (response uint uint))))
         (define-public (wrapped-get-1 (contract <trait-1>))
             (begin
-                (contract-call? contract get-1 u0)
+                (unwrap-panic (contract-call? contract get-1 u0))
                 (ok (contract-of contract))))";
     let target_contract_src = "(define-public (get-1 (x uint)) (ok u1))";
 
@@ -1263,7 +1263,7 @@ fn test_return_trait_with_contract_of_wrapped_in_let() {
             (get-1 (uint) (response uint uint))))
         (define-public (wrapped-get-1 (contract <trait-1>))
             (let ((val u0))
-                (contract-call? contract get-1 val)
+                (unwrap-panic (contract-call? contract get-1 val))
                 (ok (contract-of contract))))";
     let target_contract_src = "(define-public (get-1 (x uint)) (ok u1))";
 

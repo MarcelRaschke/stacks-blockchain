@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,54 +14,47 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::cmp::{Ord, Ordering};
 use std::io::prelude::*;
 use std::io::{Read, Write};
 use std::{fmt, io};
 
-use net::codec::{read_next, write_next};
-use net::Error as net_error;
-use net::StacksMessageCodec;
-
+use address::b58;
 use address::c32::c32_address;
+use address::c32::c32_address_decode;
 use address::public_keys_to_address_hash;
 use address::AddressHashMode;
-
-use chainstate::stacks::StacksAddress;
-use chainstate::stacks::StacksPublicKey;
-use chainstate::stacks::STACKS_ADDRESS_ENCODED_SIZE;
-
-use util::hash::Hash160;
-use util::hash::HASH160_ENCODED_SIZE;
-
-use burnchains::Address;
-use burnchains::PublicKey;
-
-use address::b58;
-use address::c32::c32_address_decode;
-
-use deps::bitcoin::blockdata::opcodes::All as BtcOp;
-use deps::bitcoin::blockdata::script::Builder as BtcScriptBuilder;
-use deps::bitcoin::blockdata::transaction::TxOut;
-use std::cmp::{Ord, Ordering};
-
 use burnchains::bitcoin::address::{
     address_type_to_version_byte, to_b52_version_byte, to_c32_version_byte,
     version_byte_to_address_type, BitcoinAddress, BitcoinAddressType,
 };
-
+use burnchains::{Address, BurnchainSigner, PublicKey};
+use chainstate::stacks::StacksPublicKey;
+use chainstate::stacks::{
+    C32_ADDRESS_VERSION_MAINNET_MULTISIG, C32_ADDRESS_VERSION_MAINNET_SINGLESIG,
+    C32_ADDRESS_VERSION_TESTNET_MULTISIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
+};
+use deps::bitcoin::blockdata::opcodes::All as BtcOp;
+use deps::bitcoin::blockdata::script::Builder as BtcScriptBuilder;
+use deps::bitcoin::blockdata::transaction::TxOut;
+use net::Error as net_error;
+use util::hash::Hash160;
+use util::hash::HASH160_ENCODED_SIZE;
 use vm::types::{PrincipalData, StandardPrincipalData};
 
-use chainstate::stacks::C32_ADDRESS_VERSION_MAINNET_SINGLESIG;
-use chainstate::stacks::C32_ADDRESS_VERSION_TESTNET_SINGLESIG;
+use crate::codec::{read_next, write_next, Error as codec_error, StacksMessageCodec};
+use crate::types::chainstate::StacksAddress;
+use crate::types::chainstate::STACKS_ADDRESS_ENCODED_SIZE;
+use crate::util::boot::boot_code_addr;
 
 impl StacksMessageCodec for StacksAddress {
-    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), net_error> {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
         write_next(fd, &self.version)?;
         fd.write_all(self.bytes.as_bytes())
-            .map_err(net_error::WriteError)
+            .map_err(codec_error::WriteError)
     }
 
-    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<StacksAddress, net_error> {
+    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<StacksAddress, codec_error> {
         let version: u8 = read_next(fd)?;
         let hash160: Hash160 = read_next(fd)?;
         Ok(StacksAddress {
@@ -103,6 +96,20 @@ impl StacksAddress {
         }
     }
 
+    /// is this a boot code address, if the supplied address is mainnet or testnet,
+    ///  it checks against the appropriate the boot code addr
+    pub fn is_boot_code_addr(&self) -> bool {
+        self == &boot_code_addr(self.is_mainnet())
+    }
+
+    pub fn is_mainnet(&self) -> bool {
+        match self.version {
+            C32_ADDRESS_VERSION_MAINNET_MULTISIG | C32_ADDRESS_VERSION_MAINNET_SINGLESIG => true,
+            C32_ADDRESS_VERSION_TESTNET_MULTISIG | C32_ADDRESS_VERSION_TESTNET_SINGLESIG => false,
+            _ => false,
+        }
+    }
+
     pub fn burn_address(mainnet: bool) -> StacksAddress {
         StacksAddress {
             version: if mainnet {
@@ -112,6 +119,26 @@ impl StacksAddress {
             },
             bytes: Hash160([0u8; 20]),
         }
+    }
+
+    pub fn from_burnchain_signer(o: &BurnchainSigner, mainnet: bool) -> Option<StacksAddress> {
+        let version = if mainnet {
+            match &o.hash_mode {
+                AddressHashMode::SerializeP2PKH => C32_ADDRESS_VERSION_MAINNET_SINGLESIG,
+                AddressHashMode::SerializeP2SH
+                | AddressHashMode::SerializeP2WPKH
+                | AddressHashMode::SerializeP2WSH => C32_ADDRESS_VERSION_MAINNET_MULTISIG,
+            }
+        } else {
+            match &o.hash_mode {
+                AddressHashMode::SerializeP2PKH => C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
+                AddressHashMode::SerializeP2SH
+                | AddressHashMode::SerializeP2WPKH
+                | AddressHashMode::SerializeP2WSH => C32_ADDRESS_VERSION_TESTNET_MULTISIG,
+            }
+        };
+
+        StacksAddress::from_public_keys(version, &o.hash_mode, o.num_sigs, &o.public_keys)
     }
 
     /// Generate an address from a given address hash mode, signature threshold, and list of public
@@ -241,14 +268,14 @@ impl Address for StacksAddress {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-
     use chainstate::stacks::*;
     use net::codec::test::check_codec_and_corruption;
     use net::codec::*;
     use net::*;
     use util::hash::*;
     use util::secp256k1::Secp256k1PublicKey as PubKey;
+
+    use super::*;
 
     #[test]
     fn tx_stacks_address_codec() {

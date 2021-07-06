@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -34,6 +34,8 @@ use std::sync::mpsc::TrySendError;
 use mio;
 use mio::net as mio_net;
 
+use crate::codec::StacksMessageCodec;
+use crate::codec::MAX_MESSAGE_LEN;
 use net::codec::*;
 use net::Error as net_error;
 use net::HttpRequestPreamble;
@@ -44,12 +46,10 @@ use net::Preamble;
 use net::ProtocolFamily;
 use net::RelayData;
 use net::StacksHttp;
-use net::StacksMessageCodec;
 use net::StacksP2P;
-use net::MAX_MESSAGE_LEN;
 
 use net::download::BLOCK_DOWNLOAD_INTERVAL;
-use net::inv::INV_SYNC_INTERVAL;
+use net::inv::{FULL_INV_SYNC_INTERVAL, INV_REWARD_CYCLES, INV_SYNC_INTERVAL};
 use net::neighbors::{
     NEIGHBOR_REQUEST_TIMEOUT, NEIGHBOR_WALK_INTERVAL, NUM_INITIAL_WALKS, WALK_MAX_DURATION,
     WALK_MIN_DURATION, WALK_RESET_INTERVAL, WALK_RESET_PROB, WALK_RETRY_COUNT, WALK_STATE_TIMEOUT,
@@ -65,6 +65,8 @@ use util::log;
 use util::pipe::*;
 use util::secp256k1::Secp256k1PublicKey;
 use util::sleep_ms;
+
+use monitoring::{update_inbound_bandwidth, update_outbound_bandwidth};
 
 /// Receiver notification handle.
 /// When a message with the expected `seq` value arrives, send it to an expected receiver (possibly
@@ -333,6 +335,8 @@ pub struct ConnectionOptions {
     pub soft_max_neighbors_per_host: u64,
     pub soft_max_neighbors_per_org: u64,
     pub soft_max_clients_per_host: u64,
+    pub max_neighbors_of_neighbor: u64,
+    pub max_http_clients: u64,
     pub neighbor_request_timeout: u64,
     pub num_initial_walks: u64,
     pub walk_retry_count: u64,
@@ -344,10 +348,14 @@ pub struct ConnectionOptions {
     pub walk_reset_interval: u64,
     pub walk_state_timeout: u64,
     pub inv_sync_interval: u64,
+    pub full_inv_sync_interval: u64,
+    pub inv_reward_cycles: u64,
     pub download_interval: u64,
     pub pingback_timeout: u64,
     pub dns_timeout: u128,
     pub max_inflight_blocks: u64,
+    pub max_inflight_attachments: u64,
+    pub max_attachment_retry_count: u64,
     pub read_only_call_limit: ExecutionCost,
     pub maximum_call_argument_size: u32,
     pub max_block_push_bandwidth: u64,
@@ -361,6 +369,7 @@ pub struct ConnectionOptions {
     pub max_block_push: u64,
     pub max_microblock_push: u64,
     pub antientropy_retry: u64,
+    pub antientropy_public: bool,
     pub max_buffered_blocks_available: u64,
     pub max_buffered_microblocks_available: u64,
     pub max_buffered_blocks: u64,
@@ -402,6 +411,8 @@ impl std::default::Default for ConnectionOptions {
             soft_max_neighbors_per_host: 10, // how many outbound connections we can have per IP address, before we start pruning them
             soft_max_neighbors_per_org: 10, // how many outbound connections we can have per AS-owning organization, before we start pruning them
             soft_max_clients_per_host: 10, // how many inbound connections we can have per IP address, before we start pruning them,
+            max_neighbors_of_neighbor: 10,
+            max_http_clients: 10,
             neighbor_request_timeout: NEIGHBOR_REQUEST_TIMEOUT, // how long to wait for a neighbor request
             num_initial_walks: NUM_INITIAL_WALKS,
             walk_retry_count: WALK_RETRY_COUNT,
@@ -413,16 +424,20 @@ impl std::default::Default for ConnectionOptions {
             walk_reset_interval: WALK_RESET_INTERVAL,
             walk_state_timeout: WALK_STATE_TIMEOUT,
             inv_sync_interval: INV_SYNC_INTERVAL, // how often to synchronize block inventories
+            full_inv_sync_interval: FULL_INV_SYNC_INTERVAL, // how often to synchronize the *full* inventory
+            inv_reward_cycles: INV_REWARD_CYCLES, // how many reward cycles of blocks to sync in a non-full inventory sync
             download_interval: BLOCK_DOWNLOAD_INTERVAL, // how often to scan for blocks to download
             pingback_timeout: 60,
-            dns_timeout: 15_000,    // DNS timeout, in millis
-            max_inflight_blocks: 6, // number of parallel block downloads
+            dns_timeout: 15_000,            // DNS timeout, in millis
+            max_inflight_blocks: 6,         // number of parallel block downloads
+            max_inflight_attachments: 6,    // number of parallel attachments downloads
+            max_attachment_retry_count: 32, // how many attempt to get an attachment before giving up
             read_only_call_limit: ExecutionCost {
                 write_length: 0,
                 write_count: 0,
                 read_length: 100000,
-                read_count: 10,
-                runtime: 10000000,
+                read_count: 30,
+                runtime: 1_000_000_000,
             },
             maximum_call_argument_size: 20 * BOUND_VALUE_SERIALIZATION_HEX,
             max_block_push_bandwidth: 0, // infinite upload bandwidth allowed
@@ -434,8 +449,9 @@ impl std::default::Default for ConnectionOptions {
             public_ip_timeout: 3600,       // re-learn the public IP ever hour, if it's not given
             public_ip_max_retries: 3, // maximum number of retries before self-throttling for $public_ip_timeout
             max_block_push: 10, // maximum number of blocksData messages to push out via our anti-entropy protocol
-            max_microblock_push: 10, // maximum number of microblocks messages to push out via our anti-entrop protocol
-            antientropy_retry: 3600 * 24, // retry pushing data only once every day
+            max_microblock_push: 10, // maximum number of microblocks messages to push out via our anti-entropy protocol
+            antientropy_retry: 3600, // retry pushing data only once every hour
+            antientropy_public: true, // run antientropy even if we're NOT NAT'ed
             max_buffered_blocks_available: 1,
             max_buffered_microblocks_available: 1,
             max_buffered_blocks: 1,
@@ -925,7 +941,7 @@ impl<P: ProtocolFamily> ConnectionInbox<P> {
         if socket_closed && total_read == 0 {
             return Err(net_error::PermanentlyDrained);
         }
-
+        update_inbound_bandwidth(total_read as i64);
         Ok(total_read)
     }
 
@@ -1140,6 +1156,7 @@ impl<P: ProtocolFamily> ConnectionOutbox<P> {
                 return Err(net_error::PeerNotConnected);
             }
         }
+        update_outbound_bandwidth(total_sent as i64);
         Ok(total_sent)
     }
 

@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,25 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-/// This module contains the code for processing the burn chain state database
-pub mod db;
-pub mod distribution;
-pub mod operations;
-pub mod sortition;
-
-pub const CONSENSUS_HASH_LIFETIME: u32 = 24;
-
 use std::convert::TryInto;
 use std::fmt;
 use std::io::Write;
-
-use burnchains::Address;
-use burnchains::BurnchainHeaderHash;
-use burnchains::PublicKey;
-use burnchains::Txid;
-
-use util::hash::{to_hex, Hash160};
-use util::vrf::VRFProof;
 
 use rand::seq::index::sample;
 use rand::Rng;
@@ -43,18 +27,29 @@ use rusqlite::Connection;
 use rusqlite::Transaction;
 use sha2::Sha256;
 
-use chainstate::burn::db::sortdb::{PoxId, SortitionHandleTx, SortitionId};
-
-use util::db::Error as db_error;
-
+use burnchains::Address;
+use burnchains::PublicKey;
+use burnchains::Txid;
+use chainstate::burn::db::sortdb::SortitionHandleTx;
 use core::SYSTEM_FORK_SET_VERSION;
-
+use util::db::Error as db_error;
 use util::hash::Hash32;
 use util::hash::Sha512Trunc256Sum;
+use util::hash::{to_hex, Hash160};
 use util::log;
 use util::uint::Uint256;
+use util::vrf::VRFProof;
 
-use chainstate::stacks::index::TrieHash;
+use crate::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, PoxId, SortitionId, VRFSeed};
+use crate::types::proof::TrieHash;
+
+/// This module contains the code for processing the burn chain state database
+pub mod db;
+pub mod distribution;
+pub mod operations;
+pub mod sortition;
+
+pub const CONSENSUS_HASH_LIFETIME: u32 = 24;
 
 pub struct ConsensusHash(pub [u8; 20]);
 impl_array_newtype!(ConsensusHash, u8, 20);
@@ -62,19 +57,17 @@ impl_array_hexstring_fmt!(ConsensusHash);
 impl_byte_array_newtype!(ConsensusHash, u8, 20);
 pub const CONSENSUS_HASH_ENCODED_SIZE: u32 = 20;
 
-pub struct BlockHeaderHash(pub [u8; 32]);
-impl_array_newtype!(BlockHeaderHash, u8, 32);
-impl_array_hexstring_fmt!(BlockHeaderHash);
-impl_byte_array_newtype!(BlockHeaderHash, u8, 32);
-impl_byte_array_serde!(BlockHeaderHash);
-pub const BLOCK_HEADER_HASH_ENCODED_SIZE: usize = 32;
+// operations hash -- the sha256 hash of a sequence of transaction IDs
+pub struct OpsHash(pub [u8; 32]);
+impl_array_newtype!(OpsHash, u8, 32);
+impl_array_hexstring_fmt!(OpsHash);
+impl_byte_array_newtype!(OpsHash, u8, 32);
 
-pub struct VRFSeed(pub [u8; 32]);
-impl_array_newtype!(VRFSeed, u8, 32);
-impl_array_hexstring_fmt!(VRFSeed);
-impl_byte_array_newtype!(VRFSeed, u8, 32);
-impl_byte_array_serde!(VRFSeed);
-pub const VRF_SEED_ENCODED_SIZE: u32 = 32;
+// rolling hash of PoW outputs to mix with the VRF seed on sortition
+pub struct SortitionHash(pub [u8; 32]);
+impl_array_newtype!(SortitionHash, u8, 32);
+impl_array_hexstring_fmt!(SortitionHash);
+impl_byte_array_newtype!(SortitionHash, u8, 32);
 
 impl VRFSeed {
     /// First-ever VRF seed from the genesis block.  It's all 0's
@@ -93,24 +86,15 @@ impl VRFSeed {
     }
 }
 
-// operations hash -- the sha256 hash of a sequence of transaction IDs
-pub struct OpsHash(pub [u8; 32]);
-impl_array_newtype!(OpsHash, u8, 32);
-impl_array_hexstring_fmt!(OpsHash);
-impl_byte_array_newtype!(OpsHash, u8, 32);
-
-// rolling hash of PoW outputs to mix with the VRF seed on sortition
-pub struct SortitionHash(pub [u8; 32]);
-impl_array_newtype!(SortitionHash, u8, 32);
-impl_array_hexstring_fmt!(SortitionHash);
-impl_byte_array_newtype!(SortitionHash, u8, 32);
-
 #[derive(Debug, Clone, PartialEq)]
 #[repr(u8)]
 pub enum Opcodes {
     LeaderBlockCommit = '[' as u8,
     LeaderKeyRegister = '^' as u8,
     UserBurnSupport = '_' as u8,
+    StackStx = 'x' as u8,
+    PreStx = 'p' as u8,
+    TransferStx = '$' as u8,
 }
 
 // a burnchain block snapshot
@@ -136,7 +120,12 @@ pub struct BlockSnapshot {
     pub canonical_stacks_tip_hash: BlockHeaderHash, // memoized canonical stacks chain tip
     pub canonical_stacks_tip_consensus_hash: ConsensusHash, // memoized canonical stacks chain tip
     pub sortition_id: SortitionId,
+    pub parent_sortition_id: SortitionId,
     pub pox_valid: bool,
+    /// the amount of accumulated coinbase ustx that
+    ///   will accrue to the sortition winner elected by this block
+    ///   or to the next winner if there is no winner in this block
+    pub accumulated_coinbase_ustx: u128,
 }
 
 impl BlockHeaderHash {
@@ -376,23 +365,19 @@ impl ConsensusHash {
 
 #[cfg(test)]
 mod tests {
-
-    use super::*;
-
-    use chainstate::burn::db::sortdb::*;
-
-    use burnchains::BurnchainHeaderHash;
+    use rusqlite::Connection;
 
     use burnchains::bitcoin::address::BitcoinAddress;
     use burnchains::bitcoin::keys::BitcoinPublicKey;
-
+    use chainstate::burn::db::sortdb::*;
     use util::db::Error as db_error;
+    use util::get_epoch_time_secs;
     use util::hash::{hex_bytes, Hash160};
     use util::log;
 
-    use rusqlite::Connection;
+    use crate::types::chainstate::BurnchainHeaderHash;
 
-    use util::get_epoch_time_secs;
+    use super::*;
 
     #[test]
     fn get_prev_consensus_hashes() {
@@ -407,6 +392,7 @@ mod tests {
             burn_block_hashes.push(prev_snapshot.sortition_id.clone());
             for i in 1..256 {
                 let snapshot_row = BlockSnapshot {
+                    accumulated_coinbase_ustx: 0,
                     pox_valid: true,
                     block_height: i,
                     burn_header_timestamp: get_epoch_time_secs(),
@@ -419,6 +405,7 @@ mod tests {
                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                         0, 0, 0, 0, 0, 0, i as u8,
                     ]),
+                    parent_sortition_id: prev_snapshot.sortition_id.clone(),
                     parent_burn_header_hash: BurnchainHeaderHash::from_bytes(&[
                         0,
                         0,
@@ -486,7 +473,15 @@ mod tests {
                 let mut tx =
                     SortitionHandleTx::begin(&mut db, &prev_snapshot.sortition_id).unwrap();
                 let next_index_root = tx
-                    .append_chain_tip_snapshot(&prev_snapshot, &snapshot_row, &vec![], None, None)
+                    .append_chain_tip_snapshot(
+                        &prev_snapshot,
+                        &snapshot_row,
+                        &vec![],
+                        &vec![],
+                        None,
+                        None,
+                        None,
+                    )
                     .unwrap();
                 burn_block_hashes.push(snapshot_row.sortition_id.clone());
                 tx.commit().unwrap();

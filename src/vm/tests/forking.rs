@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,20 +14,20 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use crate::types::chainstate::BlockHeaderHash;
+use crate::types::chainstate::StacksBlockId;
+use crate::types::proof::ClarityMarfTrieId;
+use chainstate::stacks::index::storage::TrieFileStorage;
 use vm::analysis::errors::CheckErrors;
 use vm::contexts::OwnedEnvironment;
-use vm::database::{ClarityDatabase, MarfedKV, NULL_BURN_STATE_DB, NULL_HEADER_DB};
+use vm::database::{ClarityDatabase, NULL_BURN_STATE_DB, NULL_HEADER_DB};
 use vm::errors::{Error, InterpreterResult as Result, RuntimeErrorType};
 use vm::representations::SymbolicExpression;
+use vm::tests::{execute, is_committed, is_err_code, symbols_from_values};
 use vm::types::Value;
 use vm::types::{PrincipalData, QualifiedContractIdentifier};
 
-use vm::tests::{execute, is_committed, is_err_code, symbols_from_values};
-
-use chainstate::burn::BlockHeaderHash;
-use chainstate::stacks::index::storage::TrieFileStorage;
-use chainstate::stacks::index::MarfTrieId;
-use chainstate::stacks::StacksBlockId;
+use crate::clarity_vm::database::marf::MarfedKV;
 
 const p1_str: &str = "'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR";
 
@@ -44,6 +44,76 @@ fn test_forking_simple() {
         |x| {
             branched_execution(x, false);
         },
+    );
+}
+
+#[test]
+fn test_at_block_mutations() {
+    // test how at-block works when a mutation has occurred
+    fn initialize(owned_env: &mut OwnedEnvironment) {
+        let c = QualifiedContractIdentifier::local("contract").unwrap();
+        let contract =
+            "(define-data-var datum int 1)
+             (define-public (working)
+               (ok (at-block 0x0101010101010101010101010101010101010101010101010101010101010101 (var-get datum))))
+             (define-public (broken)
+               (begin
+                 (var-set datum 10)
+                 ;; this should return 1, not 10!
+                 (ok (at-block 0x0101010101010101010101010101010101010101010101010101010101010101 (var-get datum)))))";
+
+        eprintln!("Initializing contract...");
+        owned_env.initialize_contract(c.clone(), &contract).unwrap();
+    }
+
+    fn branch(
+        owned_env: &mut OwnedEnvironment,
+        expected_value: i128,
+        to_exec: &str,
+    ) -> Result<Value> {
+        let c = QualifiedContractIdentifier::local("contract").unwrap();
+        let p1 = execute(p1_str).expect_principal();
+        eprintln!("Branched execution...");
+
+        {
+            let mut env = owned_env.get_exec_environment(None);
+            let command = format!("(var-get datum)");
+            let value = env.eval_read_only(&c, &command).unwrap();
+            assert_eq!(value, Value::Int(expected_value));
+        }
+
+        owned_env
+            .execute_transaction(p1, c, to_exec, &vec![])
+            .map(|(x, _, _)| x)
+    }
+
+    with_separate_forks_environment(
+        initialize,
+        |x| {
+            assert_eq!(
+                branch(x, 1, "working").unwrap(),
+                Value::okay(Value::Int(1)).unwrap()
+            );
+            assert_eq!(
+                branch(x, 1, "broken").unwrap(),
+                Value::okay(Value::Int(1)).unwrap()
+            );
+            assert_eq!(
+                branch(x, 10, "working").unwrap(),
+                Value::okay(Value::Int(1)).unwrap()
+            );
+            // make this test fail: this assertion _should_ be
+            //  true, but at-block is broken. when a context
+            //  switches to an at-block context, _any_ of the db
+            //  wrapping that the Clarity VM does needs to be
+            //  ignored.
+            assert_eq!(
+                branch(x, 10, "broken").unwrap(),
+                Value::okay(Value::Int(1)).unwrap()
+            );
+        },
+        |_x| {},
+        |_x| {},
     );
 }
 
@@ -74,7 +144,7 @@ fn test_at_block_good() {
         to_exec: &str,
     ) -> Result<Value> {
         let c = QualifiedContractIdentifier::local("contract").unwrap();
-        let p1 = execute(p1_str);
+        let p1 = execute(p1_str).expect_principal();
         eprintln!("Branched execution...");
 
         {
@@ -124,7 +194,7 @@ fn test_at_block_missing_defines() {
     fn initialize_1(owned_env: &mut OwnedEnvironment) {
         let c_a = QualifiedContractIdentifier::local("contract-a").unwrap();
 
-        let contract = "(define-map datum ((id bool)) ((value int)))
+        let contract = "(define-map datum { id: bool } { value: int })
 
              (define-public (flip)
                (let ((current (default-to (get value (map-get?! datum {id: true})) 0)))
@@ -186,56 +256,48 @@ where
     F3: FnOnce(&mut OwnedEnvironment),
 {
     let mut marf_kv = MarfedKV::temporary();
-    marf_kv.begin(&StacksBlockId::sentinel(), &StacksBlockId([0 as u8; 32]));
 
     {
-        marf_kv
+        let mut store = marf_kv.begin(&StacksBlockId::sentinel(), &StacksBlockId([0 as u8; 32]));
+        store
             .as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB)
             .initialize();
+        store.test_commit();
     }
-
-    marf_kv.test_commit();
-    marf_kv.begin(&StacksBlockId([0 as u8; 32]), &StacksBlockId([1 as u8; 32]));
 
     {
+        let mut store = marf_kv.begin(&StacksBlockId([0 as u8; 32]), &StacksBlockId([1 as u8; 32]));
         let mut owned_env =
-            OwnedEnvironment::new(marf_kv.as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB));
-        f(&mut owned_env)
+            OwnedEnvironment::new(store.as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB));
+        f(&mut owned_env);
+        store.test_commit();
     }
-
-    marf_kv.test_commit();
 
     // Now, we can do our forking.
 
-    marf_kv.begin(&StacksBlockId([1 as u8; 32]), &StacksBlockId([2 as u8; 32]));
-
     {
+        let mut store = marf_kv.begin(&StacksBlockId([1 as u8; 32]), &StacksBlockId([2 as u8; 32]));
         let mut owned_env =
-            OwnedEnvironment::new(marf_kv.as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB));
-        a(&mut owned_env)
+            OwnedEnvironment::new(store.as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB));
+        a(&mut owned_env);
+        store.test_commit();
     }
 
-    marf_kv.test_commit();
-
-    marf_kv.begin(&StacksBlockId([1 as u8; 32]), &StacksBlockId([3 as u8; 32]));
-
     {
+        let mut store = marf_kv.begin(&StacksBlockId([1 as u8; 32]), &StacksBlockId([3 as u8; 32]));
         let mut owned_env =
-            OwnedEnvironment::new(marf_kv.as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB));
-        b(&mut owned_env)
+            OwnedEnvironment::new(store.as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB));
+        b(&mut owned_env);
+        store.test_commit();
     }
 
-    marf_kv.test_commit();
-
-    marf_kv.begin(&StacksBlockId([2 as u8; 32]), &StacksBlockId([4 as u8; 32]));
-
     {
+        let mut store = marf_kv.begin(&StacksBlockId([2 as u8; 32]), &StacksBlockId([4 as u8; 32]));
         let mut owned_env =
-            OwnedEnvironment::new(marf_kv.as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB));
-        z(&mut owned_env)
+            OwnedEnvironment::new(store.as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB));
+        z(&mut owned_env);
+        store.test_commit();
     }
-
-    marf_kv.test_commit();
 }
 
 fn initialize_contract(owned_env: &mut OwnedEnvironment) {
@@ -289,7 +351,7 @@ fn branched_execution(owned_env: &mut OwnedEnvironment, expect_success: bool) {
 
     let (result, _, _) = owned_env
         .execute_transaction(
-            Value::Principal(PrincipalData::Standard(p1_address)),
+            p1_address.into(),
             contract_identifier,
             "destroy",
             &symbols_from_values(vec![Value::UInt(10)]),

@@ -1,10 +1,13 @@
+use super::RunLoopCallbacks;
 use crate::burnchains::Error as BurnchainControllerError;
 use crate::{
     BitcoinRegtestController, BurnchainController, ChainTip, Config, MocknetController, Node,
 };
 use stacks::chainstate::stacks::db::ClarityTx;
-
-use super::RunLoopCallbacks;
+use stacks::net::atlas::AttachmentInstance;
+use stacks::types::chainstate::BurnchainHeaderHash;
+use std::collections::HashSet;
+use std::sync::mpsc::{sync_channel, Receiver};
 
 /// RunLoop is coordinating a simulated burnchain and some simulated nodes
 /// taking turns in producing blocks.
@@ -12,25 +15,29 @@ pub struct RunLoop {
     config: Config,
     pub node: Node,
     pub callbacks: RunLoopCallbacks,
+    attachments_rx: Option<Receiver<HashSet<AttachmentInstance>>>,
 }
 
 impl RunLoop {
     pub fn new(config: Config) -> Self {
-        RunLoop::new_with_boot_exec(config, |_| {})
+        RunLoop::new_with_boot_exec(config, Box::new(|_| {}))
     }
 
     /// Sets up a runloop and node, given a config.
-    pub fn new_with_boot_exec<F>(config: Config, boot_exec: F) -> Self
-    where
-        F: Fn(&mut ClarityTx) -> (),
-    {
+    pub fn new_with_boot_exec(
+        config: Config,
+        boot_exec: Box<dyn FnOnce(&mut ClarityTx) -> ()>,
+    ) -> Self {
+        let (attachments_tx, attachments_rx) = sync_channel(1);
+
         // Build node based on config
-        let node = Node::new(config.clone(), boot_exec);
+        let node = Node::new(config.clone(), boot_exec, attachments_tx);
 
         Self {
             config,
             node,
             callbacks: RunLoopCallbacks::new(),
+            attachments_rx: Some(attachments_rx),
         }
     }
 
@@ -65,9 +72,10 @@ impl RunLoop {
         // Sync and update node with this new block.
         let (burnchain_tip, _) = burnchain.sync(None)?;
         self.node.process_burnchain_state(&burnchain_tip); // todo(ludo): should return genesis?
-        let mut chain_tip = ChainTip::genesis(self.config.get_initial_liquid_ustx());
+        let mut chain_tip = ChainTip::genesis(&BurnchainHeaderHash::zero(), 0, 0);
 
-        self.node.spawn_peer_server();
+        let attachments_rx = self.attachments_rx.take().unwrap();
+        self.node.spawn_peer_server(attachments_rx);
 
         // Bootstrap the chain: node will start a new tenure,
         // using the sortition hash from block #1 for generating a VRF.

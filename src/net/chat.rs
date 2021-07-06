@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,67 +14,58 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::mem;
-
-use net::asn::ASEntry4;
-use net::db::PeerDB;
-use net::Error as net_error;
-use net::Neighbor;
-use net::NeighborKey;
-use net::PeerAddress;
-
-use net::codec::*;
-use net::relay::*;
-use net::*;
-
-use net::connection::ConnectionOptions;
-use net::connection::ConnectionP2P;
-use net::connection::ReplyHandleP2P;
-use net::GetBlocksInv;
-use net::GetPoxInv;
-use net::StacksMessage;
-use net::StacksP2P;
-use net::GETPOXINV_MAX_BITLEN;
-
-use net::neighbors::MAX_NEIGHBOR_BLOCK_DELAY;
-
-use net::db::*;
-
-use util::db::DBConn;
-use util::db::Error as db_error;
-use util::secp256k1::Secp256k1PrivateKey;
-use util::secp256k1::Secp256k1PublicKey;
-
-use burnchains::PublicKey;
-
-use chainstate::burn::db::sortdb;
-use chainstate::burn::db::sortdb::{BlockHeaderCache, PoxId, SortitionDB};
-
-use burnchains::Burnchain;
-use burnchains::BurnchainView;
-use chainstate::stacks::db::StacksChainState;
-use chainstate::stacks::StacksBlockHeader;
-use chainstate::stacks::StacksPublicKey;
-use monitoring;
-
-use std::net::SocketAddr;
-
+use std::cmp;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-
-use std::cmp;
 use std::convert::TryFrom;
 use std::io::Read;
 use std::io::Write;
-
-use util::get_epoch_time_secs;
-use util::hash::to_hex;
-use util::log;
+use std::mem;
+use std::net::SocketAddr;
 
 use rand;
 use rand::thread_rng;
 use rand::Rng;
+
+use burnchains::Burnchain;
+use burnchains::BurnchainView;
+use burnchains::PublicKey;
+use chainstate::burn::db::sortdb;
+use chainstate::burn::db::sortdb::{BlockHeaderCache, SortitionDB};
+use chainstate::stacks::db::StacksChainState;
+use chainstate::stacks::StacksPublicKey;
+use monitoring;
+use net::asn::ASEntry4;
+use net::codec::*;
+use net::connection::ConnectionOptions;
+use net::connection::ConnectionP2P;
+use net::connection::ReplyHandleP2P;
+use net::db::PeerDB;
+use net::db::*;
+use net::neighbors::MAX_NEIGHBOR_BLOCK_DELAY;
+use net::relay::*;
+use net::Error as net_error;
+use net::GetBlocksInv;
+use net::GetPoxInv;
+use net::Neighbor;
+use net::NeighborKey;
+use net::PeerAddress;
+use net::StacksMessage;
+use net::StacksP2P;
+use net::GETPOXINV_MAX_BITLEN;
+use net::*;
+use util::db::DBConn;
+use util::db::Error as db_error;
+use util::get_epoch_time_secs;
+use util::hash::to_hex;
+use util::log;
+use util::secp256k1::Secp256k1PrivateKey;
+use util::secp256k1::Secp256k1PublicKey;
+
+use crate::types::chainstate::PoxId;
+use crate::types::chainstate::StacksBlockHeader;
+use crate::types::StacksPublicKeyBuffer;
 
 // did we or did we not successfully send a message?
 #[derive(Debug, Clone)]
@@ -420,7 +411,7 @@ impl Neighbor {
 
         let mut neighbor = match peer_opt {
             Some(neighbor) => {
-                let mut ret = neighbor.clone();
+                let mut ret = neighbor;
                 ret.addr = addr.clone();
                 ret
             }
@@ -512,9 +503,9 @@ impl ConversationP2P {
             data_url: UrlString::try_from("".to_string()).unwrap(),
 
             burnchain_tip_height: 0,
-            burnchain_tip_burn_header_hash: BurnchainHeaderHash([0u8; 32]),
+            burnchain_tip_burn_header_hash: BurnchainHeaderHash::zero(),
             burnchain_stable_tip_height: 0,
-            burnchain_stable_tip_burn_header_hash: BurnchainHeaderHash([0u8; 32]),
+            burnchain_stable_tip_burn_header_hash: BurnchainHeaderHash::zero(),
 
             stats: NeighborStats::new(outbound),
             reply_handles: VecDeque::new(),
@@ -999,7 +990,8 @@ impl ConversationP2P {
     /// Handle an inbound NAT-punch request -- just tell the peer what we think their IP/port are.
     /// No authentication from the peer is necessary.
     fn handle_natpunch_request(&self, chain_view: &BurnchainView, nonce: u32) -> StacksMessage {
-        monitoring::increment_p2p_msg_nat_punch_request_received_counter();
+        // monitoring::increment_p2p_msg_nat_punch_request_received_counter();
+        monitoring::increment_msg_counter("p2p_nat_punch_request".to_string());
 
         let natpunch_data = NatPunchData {
             addrbytes: self.peer_addrbytes.clone(),
@@ -1166,7 +1158,8 @@ impl ConversationP2P {
         chain_view: &BurnchainView,
         message: &mut StacksMessage,
     ) -> Result<Option<StacksMessage>, net_error> {
-        monitoring::increment_p2p_msg_ping_received_counter();
+        // monitoring::increment_p2p_msg_ping_received_counter();
+        monitoring::increment_msg_counter("p2p_ping".to_string());
 
         let ping_data = match message.payload {
             StacksMessageType::Ping(ref data) => data,
@@ -1189,7 +1182,8 @@ impl ConversationP2P {
         chain_view: &BurnchainView,
         preamble: &Preamble,
     ) -> Result<ReplyHandleP2P, net_error> {
-        monitoring::increment_p2p_msg_get_neighbors_received_counter();
+        // monitoring::increment_p2p_msg_get_neighbors_received_counter();
+        monitoring::increment_msg_counter("p2p_get_neighbors".to_string());
 
         // get neighbors at random as long as they're fresh
         let mut neighbors = PeerDB::get_random_neighbors(
@@ -1290,7 +1284,7 @@ impl ConversationP2P {
         if base_snapshot.block_height > burnchain.first_block_height + 1
             && !burnchain.is_reward_cycle_start(base_snapshot.block_height)
         {
-            debug!(
+            warn!(
                 "{:?}: Snapshot for {:?} is at height {}, which is not aligned to a reward cycle",
                 _local_peer, base_snapshot.consensus_hash, base_snapshot.block_height
             );
@@ -1377,7 +1371,9 @@ impl ConversationP2P {
         preamble: &Preamble,
         get_blocks_inv: &GetBlocksInv,
     ) -> Result<ReplyHandleP2P, net_error> {
-        monitoring::increment_p2p_msg_get_blocks_inv_received_counter();
+        // monitoring::increment_p2p_msg_get_blocks_inv_received_counter();
+        monitoring::increment_msg_counter("p2p_get_blocks_inv".to_string());
+
         let mut response = ConversationP2P::make_getblocksinv_response(
             local_peer,
             &self.burnchain,
@@ -1811,6 +1807,13 @@ impl ConversationP2P {
                         break;
                     }
                 }
+                Err(net_error::PermanentlyDrained) => {
+                    trace!(
+                        "{:?}: failed to recv on P2P conversation: PermanentlyDrained",
+                        self
+                    );
+                    return Err(net_error::PermanentlyDrained);
+                }
                 Err(e) => {
                     info!("{:?}: failed to recv on P2P conversation: {:?}", self, &e);
                     return Err(e);
@@ -1945,7 +1948,8 @@ impl ConversationP2P {
         // already have public key; match payload
         let reply_opt = match msg.payload {
             StacksMessageType::Handshake(_) => {
-                monitoring::increment_p2p_msg_authenticated_handshake_received_counter();
+                // monitoring::increment_p2p_msg_authenticated_handshake_received_counter();
+                monitoring::increment_msg_counter("p2p_authenticated_handshake".to_string());
 
                 debug!("{:?}: Got Handshake", &self);
                 let (handshake_opt, handled) =
@@ -2016,8 +2020,8 @@ impl ConversationP2P {
         let solicited = self.connection.is_solicited(&msg);
         let reply_opt = match msg.payload {
             StacksMessageType::Handshake(_) => {
-                monitoring::increment_p2p_msg_unauthenticated_handshake_received_counter();
-
+                // monitoring::increment_p2p_msg_unauthenticated_handshake_received_counter();
+                monitoring::increment_msg_counter("p2p_unauthenticated_handshake".to_string());
                 test_debug!("{:?}: Got unauthenticated Handshake", &self);
                 let (reply_opt, handled) =
                     self.handle_handshake(local_peer, peerdb, burnchain_view, msg, false)?;
@@ -2092,7 +2096,8 @@ impl ConversationP2P {
                     nack_payload,
                 );
 
-                monitoring::increment_p2p_msg_nack_sent_counter();
+                // monitoring::increment_p2p_msg_nack_sent_counter();
+                monitoring::increment_msg_counter("p2p_nack_sent".to_string());
 
                 // unauthenticated, so don't forward it (but do consume it, and do nack it)
                 consume = true;
@@ -2298,36 +2303,36 @@ impl ConversationP2P {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use burnchains::burnchain::*;
-    use burnchains::*;
-    use chainstate::burn::db::sortdb::*;
-    use chainstate::burn::*;
-    use chainstate::*;
-    use net::connection::*;
-    use net::db::*;
-    use net::p2p::*;
-    use net::*;
-    use util::pipe::*;
-    use util::secp256k1::*;
-    use util::uint::*;
-
-    use burnchains::bitcoin::address::BitcoinAddress;
-    use burnchains::bitcoin::keys::BitcoinPublicKey;
-
-    use std::net::SocketAddr;
-    use std::net::SocketAddrV4;
-
     use std::fs;
     use std::io::prelude::*;
     use std::io::Read;
     use std::io::Write;
+    use std::net::SocketAddr;
+    use std::net::SocketAddrV4;
 
-    use util::test::*;
-
+    use burnchains::bitcoin::address::BitcoinAddress;
+    use burnchains::bitcoin::keys::BitcoinPublicKey;
+    use burnchains::burnchain::*;
+    use burnchains::*;
+    use chainstate::burn::db::sortdb::*;
+    use chainstate::burn::*;
+    use chainstate::stacks::db::ChainStateBootData;
+    use chainstate::*;
+    use core::{NETWORK_P2P_PORT, PEER_VERSION_TESTNET};
+    use net::connection::*;
+    use net::db::*;
+    use net::p2p::*;
     use net::test::*;
+    use net::*;
+    use util::pipe::*;
+    use util::secp256k1::*;
+    use util::test::*;
+    use util::uint::*;
+    use vm::costs::ExecutionCost;
 
-    use core::{NETWORK_P2P_PORT, PEER_VERSION};
+    use crate::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, SortitionId};
+
+    use super::*;
 
     fn make_test_chain_dbs(
         testname: &str,
@@ -2349,7 +2354,7 @@ mod test {
         fs::create_dir_all(&test_path).unwrap();
 
         let sortdb_path = format!("{}/burn", &test_path);
-        let peerdb_path = format!("{}/peers.db", &test_path);
+        let peerdb_path = format!("{}/peers.sqlite", &test_path);
         let chainstate_path = format!("{}/chainstate", &test_path);
 
         let peerdb = PeerDB::connect(
@@ -2374,7 +2379,20 @@ mod test {
             true,
         )
         .unwrap();
-        let (chainstate, _) = StacksChainState::open(false, network_id, &chainstate_path).unwrap();
+
+        let first_burnchain_block_height = burnchain.first_block_height;
+        let first_burnchain_block_hash = burnchain.first_block_hash;
+
+        let mut boot_data = ChainStateBootData::new(&burnchain, vec![], None);
+
+        let (chainstate, _) = StacksChainState::open_and_exec(
+            false,
+            network_id,
+            &chainstate_path,
+            Some(&mut boot_data),
+            ExecutionCost::max_value(),
+        )
+        .unwrap();
 
         let pox_id = {
             let ic = sortdb.index_conn();
@@ -2466,6 +2484,7 @@ mod test {
 
             next_snapshot.consensus_hash = ConsensusHash(big_i_bytes_20);
             next_snapshot.sortition_id = SortitionId(big_i_bytes_32.clone());
+            next_snapshot.parent_sortition_id = prev_snapshot.sortition_id.clone();
             next_snapshot.ops_hash = OpsHash::from_bytes(&big_i_bytes_32).unwrap();
             next_snapshot.winning_stacks_block_hash = BlockHeaderHash(big_i_bytes_32.clone());
             next_snapshot.winning_block_txid = Txid(big_i_bytes_32.clone());
@@ -2479,7 +2498,15 @@ mod test {
             let mut tx = SortitionHandleTx::begin(sortdb, &prev_snapshot.sortition_id).unwrap();
 
             let next_index_root = tx
-                .append_chain_tip_snapshot(&prev_snapshot, &next_snapshot, &vec![], None, None)
+                .append_chain_tip_snapshot(
+                    &prev_snapshot,
+                    &next_snapshot,
+                    &vec![],
+                    &vec![],
+                    None,
+                    None,
+                    None,
+                )
                 .unwrap();
             next_snapshot.index_root = next_index_root;
 
@@ -2503,7 +2530,7 @@ mod test {
         .unwrap();
 
         Burnchain {
-            peer_version: PEER_VERSION,
+            peer_version: PEER_VERSION_TESTNET,
             network_id: 0,
             chain_name: "bitcoin".to_string(),
             network_name: "testnet".to_string(),
@@ -2511,7 +2538,9 @@ mod test {
             consensus_hash_lifetime: 24,
             stable_confirmations: 7,
             first_block_height: 12300,
+            initial_reward_start_block: 12300,
             first_block_hash: first_burn_hash.clone(),
+            first_block_timestamp: 0,
             pox_constants: PoxConstants::test_default(),
         }
     }

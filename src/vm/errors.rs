@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,12 +14,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use chainstate::burn::BlockHeaderHash;
+use crate::types::chainstate::BlockHeaderHash;
 use chainstate::stacks::index::Error as MarfError;
 use rusqlite::Error as SqliteError;
 use serde_json::Error as SerdeJSONErr;
 use std::error;
 use std::fmt;
+use util::db::Error as DatabaseError;
 pub use vm::analysis::errors::CheckErrors;
 pub use vm::analysis::errors::{check_argument_count, check_arguments_at_least};
 use vm::ast::errors::ParseError;
@@ -60,6 +61,8 @@ pub enum InterpreterError {
     FailureConstructingTupleWithType,
     FailureConstructingListWithType,
     InsufficientBalance,
+    CostContractLoadFailure,
+    DBError(IncomparableError<DatabaseError>),
 }
 
 /// RuntimeErrors are errors that smart contracts are expected
@@ -70,6 +73,7 @@ pub enum RuntimeErrorType {
     ArithmeticOverflow,
     ArithmeticUnderflow,
     SupplyOverflow(u128, u128),
+    SupplyUnderflow(u128, u128),
     DivisionByZero,
     // error in parsing types
     ParseError(String),
@@ -199,6 +203,11 @@ impl From<InterpreterError> for Error {
     fn from(err: InterpreterError) -> Self {
         Error::Interpreter(err)
     }
+}
+
+#[cfg(test)]
+impl From<Error> for () {
+    fn from(err: Error) -> Self {}
 }
 
 impl Into<Value> for ShortReturnType {

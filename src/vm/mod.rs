@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -27,7 +27,6 @@ pub mod types;
 pub mod contracts;
 
 pub mod ast;
-pub mod clarity;
 pub mod contexts;
 pub mod database;
 pub mod representations;
@@ -42,13 +41,14 @@ pub mod docs;
 #[cfg(test)]
 pub mod tests;
 
+use crate::clarity_vm::database::MemoryBackingStore;
 use vm::callables::CallableType;
 use vm::contexts::GlobalContext;
-use vm::contexts::{CallStack, ContractContext, Environment, LocalContext};
+pub use vm::contexts::{CallStack, ContractContext, Environment, LocalContext};
 use vm::costs::{
-    cost_functions, CostOverflowingMath, CostTracker, LimitedCostTracker, MemoryConsumer,
+    cost_functions, runtime_cost, CostOverflowingMath, CostTracker, LimitedCostTracker,
+    MemoryConsumer,
 };
-use vm::database::MemoryBackingStore;
 use vm::errors::{
     CheckErrors, Error, InterpreterError, InterpreterResult as Result, RuntimeErrorType,
 };
@@ -60,9 +60,10 @@ pub use vm::representations::{
     ClarityName, ContractName, SymbolicExpression, SymbolicExpressionType,
 };
 
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 pub use vm::contexts::MAX_CONTEXT_DEPTH;
-pub use vm::functions::{get_stx_balance_snapshot, stx_transfer_consolidated};
+use vm::costs::cost_functions::ClarityCostFunction;
+pub use vm::functions::stx_transfer_consolidated;
 
 const MAX_CALL_STACK_DEPTH: usize = 64;
 
@@ -77,12 +78,16 @@ fn lookup_variable(name: &str, context: &LocalContext, env: &mut Environment) ->
         if let Some(value) = variables::lookup_reserved_variable(name, context, env)? {
             Ok(value)
         } else {
-            runtime_cost!(cost_functions::LOOKUP_VARIABLE_DEPTH, env, context.depth())?;
+            runtime_cost(
+                ClarityCostFunction::LookupVariableDepth,
+                env,
+                context.depth(),
+            )?;
             if let Some(value) = context
                 .lookup_variable(name)
                 .or_else(|| env.contract_context.lookup_variable(name))
             {
-                runtime_cost!(cost_functions::LOOKUP_VARIABLE_SIZE, env, value.size())?;
+                runtime_cost(ClarityCostFunction::LookupVariableSize, env, value.size())?;
                 Ok(value.clone())
             } else if let Some(value) = context.lookup_callable_contract(name) {
                 let contract_identifier = &value.0;
@@ -97,7 +102,7 @@ fn lookup_variable(name: &str, context: &LocalContext, env: &mut Environment) ->
 }
 
 pub fn lookup_function(name: &str, env: &mut Environment) -> Result<CallableType> {
-    runtime_cost!(cost_functions::LOOKUP_FUNCTION, env, 0)?;
+    runtime_cost(ClarityCostFunction::LookupFunction, env, 0)?;
 
     if let Some(result) = functions::lookup_reserved_functions(name) {
         Ok(result)
@@ -149,16 +154,15 @@ pub fn apply(
         env.call_stack.remove(&identifier, track_recursion)?;
         resp
     } else {
-        env.call_stack.insert(&identifier, track_recursion);
-
         let mut used_memory = 0;
         let mut evaluated_args = vec![];
+        env.call_stack.incr_apply_depth();
         for arg_x in args.iter() {
             let arg_value = match eval(arg_x, env, context) {
                 Ok(x) => x,
                 Err(e) => {
                     env.drop_memory(used_memory);
-                    env.call_stack.remove(&identifier, track_recursion)?;
+                    env.call_stack.decr_apply_depth();
                     return Err(e);
                 }
             };
@@ -167,18 +171,21 @@ pub fn apply(
                 Ok(_x) => {}
                 Err(e) => {
                     env.drop_memory(used_memory);
-                    env.call_stack.remove(&identifier, track_recursion)?;
+                    env.call_stack.decr_apply_depth();
                     return Err(Error::from(e));
                 }
             };
             used_memory += arg_value.get_memory_use();
             evaluated_args.push(arg_value);
         }
+        env.call_stack.decr_apply_depth();
+
+        env.call_stack.insert(&identifier, track_recursion);
         let mut resp = match function {
             CallableType::NativeFunction(_, function, cost_function) => {
-                let arg_size = evaluated_args.len();
-                runtime_cost!(cost_function, env, arg_size)?;
-                function.apply(evaluated_args)
+                runtime_cost(*cost_function, env, evaluated_args.len())
+                    .map_err(Error::from)
+                    .and_then(|_| function.apply(evaluated_args))
             }
             CallableType::UserFunction(function) => function.apply(&evaluated_args, env),
             _ => panic!("Should be unreachable."),
@@ -238,9 +245,7 @@ fn eval_all(
     let context = LocalContext::new();
     let mut total_memory_use = 0;
 
-    let publisher = Value::Principal(PrincipalData::Standard(
-        contract_context.contract_identifier.issuer.clone(),
-    ));
+    let publisher: PrincipalData = contract_context.contract_identifier.issuer.clone().into();
 
     finally_drop_memory!(global_context, total_memory_use; {
         for exp in expressions {
@@ -252,7 +257,7 @@ fn eval_all(
             })?;
             match try_define {
                 DefineResult::Variable(name, value) => {
-                    runtime_cost!(cost_functions::BIND_NAME, global_context, 0)?;
+                    runtime_cost(ClarityCostFunction::BindName, global_context, 0)?;
                     let value_memory_use = value.get_memory_use();
                     global_context.add_memory(value_memory_use)?;
                     total_memory_use += value_memory_use;
@@ -260,12 +265,12 @@ fn eval_all(
                     contract_context.variables.insert(name, value);
                 },
                 DefineResult::Function(name, value) => {
-                    runtime_cost!(cost_functions::BIND_NAME, global_context, 0)?;
+                    runtime_cost(ClarityCostFunction::BindName, global_context, 0)?;
 
                     contract_context.functions.insert(name, value);
                 },
                 DefineResult::PersistedVariable(name, value_type, value) => {
-                    runtime_cost!(cost_functions::CREATE_VAR, global_context, value_type.size())?;
+                    runtime_cost(ClarityCostFunction::CreateVar, global_context, value_type.size())?;
                     contract_context.persisted_names.insert(name.clone());
 
                     global_context.add_memory(value_type.type_size()
@@ -273,11 +278,13 @@ fn eval_all(
 
                     global_context.add_memory(value.size() as u64)?;
 
-                    global_context.database.create_variable(&contract_context.contract_identifier, &name, value_type);
-                    global_context.database.set_variable(&contract_context.contract_identifier, &name, value)?;
+                    let data_type = global_context.database.create_variable(&contract_context.contract_identifier, &name, value_type);
+                    global_context.database.set_variable(&contract_context.contract_identifier, &name, value, &data_type)?;
+
+                    contract_context.meta_data_var.insert(name, data_type);
                 },
                 DefineResult::Map(name, key_type, value_type) => {
-                    runtime_cost!(cost_functions::CREATE_MAP, global_context,
+                    runtime_cost(ClarityCostFunction::CreateMap, global_context,
                                   u64::from(key_type.size()).cost_overflow_add(
                                       u64::from(value_type.size()))?)?;
                     contract_context.persisted_names.insert(name.clone());
@@ -287,25 +294,31 @@ fn eval_all(
                     global_context.add_memory(value_type.type_size()
                                               .expect("type size should be realizable") as u64)?;
 
-                    global_context.database.create_map(&contract_context.contract_identifier, &name, key_type, value_type);
+                    let data_type = global_context.database.create_map(&contract_context.contract_identifier, &name, key_type, value_type);
+
+                    contract_context.meta_data_map.insert(name, data_type);
                 },
                 DefineResult::FungibleToken(name, total_supply) => {
-                    runtime_cost!(cost_functions::CREATE_FT, global_context, 0)?;
+                    runtime_cost(ClarityCostFunction::CreateFt, global_context, 0)?;
                     contract_context.persisted_names.insert(name.clone());
 
                     global_context.add_memory(TypeSignature::UIntType.type_size()
                                               .expect("type size should be realizable") as u64)?;
 
-                    global_context.database.create_fungible_token(&contract_context.contract_identifier, &name, &total_supply);
+                    let data_type = global_context.database.create_fungible_token(&contract_context.contract_identifier, &name, &total_supply);
+
+                    contract_context.meta_ft.insert(name, data_type);
                 },
                 DefineResult::NonFungibleAsset(name, asset_type) => {
-                    runtime_cost!(cost_functions::CREATE_NFT, global_context, asset_type.size())?;
+                    runtime_cost(ClarityCostFunction::CreateNft, global_context, asset_type.size())?;
                     contract_context.persisted_names.insert(name.clone());
 
                     global_context.add_memory(asset_type.type_size()
                                               .expect("type size should be realizable") as u64)?;
 
-                    global_context.database.create_non_fungible_token(&contract_context.contract_identifier, &name, &asset_type);
+                    let data_type = global_context.database.create_non_fungible_token(&contract_context.contract_identifier, &name, &asset_type);
+
+                    contract_context.meta_nft.insert(name, data_type);
                 },
                 DefineResult::Trait(name, trait_type) => {
                     contract_context.defined_traits.insert(name, trait_type);
@@ -344,7 +357,7 @@ pub fn execute(program: &str) -> Result<Option<Value>> {
     let mut contract_context = ContractContext::new(contract_id.clone());
     let mut marf = MemoryBackingStore::new();
     let conn = marf.as_clarity_db();
-    let mut global_context = GlobalContext::new(conn, LimitedCostTracker::new_max_limit());
+    let mut global_context = GlobalContext::new(false, conn, LimitedCostTracker::new_free());
     global_context.execute(|g| {
         let parsed = ast::build_ast(&contract_id, program, &mut ())?.expressions;
         eval_all(&parsed, &mut contract_context, g)
@@ -353,10 +366,10 @@ pub fn execute(program: &str) -> Result<Option<Value>> {
 
 #[cfg(test)]
 mod test {
+    use crate::clarity_vm::database::MemoryBackingStore;
     use std::collections::HashMap;
     use vm::callables::{DefineType, DefinedFunction};
     use vm::costs::LimitedCostTracker;
-    use vm::database::MemoryBackingStore;
     use vm::errors::RuntimeErrorType;
     use vm::eval;
     use vm::execute;
@@ -399,7 +412,7 @@ mod test {
 
         let mut marf = MemoryBackingStore::new();
         let mut global_context =
-            GlobalContext::new(marf.as_clarity_db(), LimitedCostTracker::new_max_limit());
+            GlobalContext::new(false, marf.as_clarity_db(), LimitedCostTracker::new_free());
 
         contract_context
             .variables

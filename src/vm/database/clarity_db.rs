@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,45 +14,40 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use rusqlite::OptionalExtension;
 use std::collections::{HashMap, VecDeque};
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 
+use core::{
+    BITCOIN_REGTEST_FIRST_BLOCK_HASH, BITCOIN_REGTEST_FIRST_BLOCK_HEIGHT,
+    BITCOIN_REGTEST_FIRST_BLOCK_TIMESTAMP, FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH,
+    POX_REWARD_CYCLE_LENGTH,
+};
+use util::hash::{to_hex, Hash160, Sha256Sum, Sha512Trunc256Sum};
+use vm::analysis::{AnalysisDatabase, ContractAnalysis};
 use vm::contracts::Contract;
+use vm::costs::CostOverflowingMath;
+use vm::database::structures::{
+    ClarityDeserializable, ClaritySerializable, ContractMetadata, DataMapMetadata,
+    DataVariableMetadata, FungibleTokenMetadata, NonFungibleTokenMetadata, STXBalance,
+    STXBalanceSnapshot, SimmedBlock,
+};
+use vm::database::ClarityBackingStore;
+use vm::database::RollbackWrapper;
 use vm::errors::{
     CheckErrors, Error, IncomparableError, InterpreterError, InterpreterResult as Result,
     RuntimeErrorType,
 };
+use vm::representations::ClarityName;
 use vm::types::{
-    OptionalData, PrincipalData, QualifiedContractIdentifier, StandardPrincipalData,
+    OptionalData, PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, TupleData,
     TupleTypeSignature, TypeSignature, Value, NONE,
 };
 
-use burnchains::BurnchainHeaderHash;
-use chainstate::burn::{BlockHeaderHash, ConsensusHash, VRFSeed};
-use chainstate::stacks::db::{MinerPaymentSchedule, StacksHeaderInfo};
-use chainstate::stacks::index::proofs::TrieMerkleProof;
-use chainstate::stacks::StacksBlockHeader;
-use chainstate::stacks::{StacksAddress, StacksBlockId};
-
-use util::db::{DBConn, FromRow};
-use util::hash::{Sha256Sum, Sha512Trunc256Sum};
-use vm::costs::CostOverflowingMath;
-use vm::database::structures::{
-    ClarityDeserializable, ClaritySerializable, ContractMetadata, DataMapMetadata,
-    DataVariableMetadata, FungibleTokenMetadata, NonFungibleTokenMetadata, STXBalance, SimmedBlock,
+use crate::types::chainstate::{
+    BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksAddress, StacksBlockHeader,
+    StacksBlockId, VRFSeed,
 };
-use vm::database::RollbackWrapper;
-use vm::database::{ClarityBackingStore, MarfedKV};
-
-use chainstate::burn::db::sortdb::{
-    SortitionDB, SortitionDBConn, SortitionHandleConn, SortitionHandleTx, SortitionId,
-};
-
-use core::{
-    FIRST_BURNCHAIN_BLOCK_HASH, FIRST_BURNCHAIN_BLOCK_HEIGHT, FIRST_BURNCHAIN_BLOCK_TIMESTAMP,
-    FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH, POX_REWARD_CYCLE_LENGTH,
-};
+use crate::types::proof::TrieMerkleProof;
 
 pub const STORE_CONTRACT_SRC_INTERFACE: bool = true;
 
@@ -93,7 +88,6 @@ pub trait HeadersDB {
     fn get_burn_block_time_for_block(&self, id_bhh: &StacksBlockId) -> Option<u64>;
     fn get_burn_block_height_for_block(&self, id_bhh: &StacksBlockId) -> Option<u32>;
     fn get_miner_address(&self, id_bhh: &StacksBlockId) -> Option<StacksAddress>;
-    fn get_total_liquid_ustx(&self, id_bhh: &StacksBlockId) -> u128;
 }
 
 pub trait BurnStateDB {
@@ -103,64 +97,6 @@ pub trait BurnStateDB {
         height: u32,
         sortition_id: &SortitionId,
     ) -> Option<BurnchainHeaderHash>;
-}
-
-fn get_stacks_header_info(conn: &DBConn, id_bhh: &StacksBlockId) -> Option<StacksHeaderInfo> {
-    conn.query_row(
-        "SELECT * FROM block_headers WHERE index_block_hash = ?",
-        [id_bhh].iter(),
-        |x| StacksHeaderInfo::from_row(x).expect("Bad stacks header info in database"),
-    )
-    .optional()
-    .expect("Unexpected SQL failure querying block header table")
-}
-
-fn get_miner_info(conn: &DBConn, id_bhh: &StacksBlockId) -> Option<MinerPaymentSchedule> {
-    conn.query_row(
-        "SELECT * FROM payments WHERE index_block_hash = ? AND miner = 1",
-        [id_bhh].iter(),
-        |x| MinerPaymentSchedule::from_row(x).expect("Bad payment info in database"),
-    )
-    .optional()
-    .expect("Unexpected SQL failure querying payment table")
-}
-
-impl HeadersDB for DBConn {
-    fn get_stacks_block_header_hash_for_block(
-        &self,
-        id_bhh: &StacksBlockId,
-    ) -> Option<BlockHeaderHash> {
-        get_stacks_header_info(self, id_bhh).map(|x| x.anchored_header.block_hash())
-    }
-
-    fn get_burn_header_hash_for_block(
-        &self,
-        id_bhh: &StacksBlockId,
-    ) -> Option<BurnchainHeaderHash> {
-        get_stacks_header_info(self, id_bhh).map(|x| x.burn_header_hash)
-    }
-
-    fn get_burn_block_time_for_block(&self, id_bhh: &StacksBlockId) -> Option<u64> {
-        get_stacks_header_info(self, id_bhh).map(|x| x.burn_header_timestamp)
-    }
-
-    fn get_burn_block_height_for_block(&self, id_bhh: &StacksBlockId) -> Option<u32> {
-        get_stacks_header_info(self, id_bhh).map(|x| x.burn_header_height)
-    }
-
-    fn get_vrf_seed_for_block(&self, id_bhh: &StacksBlockId) -> Option<VRFSeed> {
-        get_stacks_header_info(self, id_bhh).map(|x| VRFSeed::from_proof(&x.anchored_header.proof))
-    }
-
-    fn get_miner_address(&self, id_bhh: &StacksBlockId) -> Option<StacksAddress> {
-        get_miner_info(self, id_bhh).map(|x| x.address)
-    }
-
-    fn get_total_liquid_ustx(&self, id_bhh: &StacksBlockId) -> u128 {
-        get_stacks_header_info(self, id_bhh)
-            .map(|x| x.total_liquid_ustx)
-            .unwrap_or(0)
-    }
 }
 
 impl HeadersDB for &dyn HeadersDB {
@@ -184,57 +120,6 @@ impl HeadersDB for &dyn HeadersDB {
     }
     fn get_miner_address(&self, bhh: &StacksBlockId) -> Option<StacksAddress> {
         (*self).get_miner_address(bhh)
-    }
-    fn get_total_liquid_ustx(&self, bhh: &StacksBlockId) -> u128 {
-        (*self).get_total_liquid_ustx(bhh)
-    }
-}
-
-impl BurnStateDB for SortitionHandleTx<'_> {
-    fn get_burn_block_height(&self, sortition_id: &SortitionId) -> Option<u32> {
-        match SortitionDB::get_block_snapshot(self.tx(), sortition_id) {
-            Ok(Some(x)) => Some(x.block_height as u32),
-            _ => return None,
-        }
-    }
-
-    fn get_burn_header_hash(
-        &self,
-        height: u32,
-        sortition_id: &SortitionId,
-    ) -> Option<BurnchainHeaderHash> {
-        let readonly_marf = self
-            .index()
-            .reopen_readonly()
-            .expect("BUG: failure trying to get a read-only interface into the sortition db.");
-        let mut context = self.context.clone();
-        context.chain_tip = sortition_id.clone();
-        let db_handle = SortitionHandleConn::new(&readonly_marf, context);
-        match db_handle.get_block_snapshot_by_height(height as u64) {
-            Ok(Some(x)) => Some(x.burn_header_hash),
-            _ => return None,
-        }
-    }
-}
-
-impl BurnStateDB for SortitionDBConn<'_> {
-    fn get_burn_block_height(&self, sortition_id: &SortitionId) -> Option<u32> {
-        match SortitionDB::get_block_snapshot(self.conn(), sortition_id) {
-            Ok(Some(x)) => Some(x.block_height as u32),
-            _ => return None,
-        }
-    }
-
-    fn get_burn_header_hash(
-        &self,
-        height: u32,
-        sortition_id: &SortitionId,
-    ) -> Option<BurnchainHeaderHash> {
-        let db_handle = SortitionHandleConn::open_reader(self, &sortition_id).ok()?;
-        match db_handle.get_block_snapshot_by_height(height as u64) {
-            Ok(Some(x)) => Some(x.burn_header_hash),
-            _ => return None,
-        }
     }
 }
 
@@ -269,7 +154,9 @@ impl HeadersDB for NullHeadersDB {
                 &FIRST_STACKS_BLOCK_HASH,
             )
         {
-            Some(FIRST_BURNCHAIN_BLOCK_HASH)
+            let first_block_hash =
+                BurnchainHeaderHash::from_hex(BITCOIN_REGTEST_FIRST_BLOCK_HASH).unwrap();
+            Some(first_block_hash)
         } else {
             None
         }
@@ -299,7 +186,7 @@ impl HeadersDB for NullHeadersDB {
                 &FIRST_STACKS_BLOCK_HASH,
             )
         {
-            Some(FIRST_BURNCHAIN_BLOCK_TIMESTAMP)
+            Some(BITCOIN_REGTEST_FIRST_BLOCK_TIMESTAMP as u64)
         } else {
             None
         }
@@ -311,16 +198,13 @@ impl HeadersDB for NullHeadersDB {
                 &FIRST_STACKS_BLOCK_HASH,
             )
         {
-            Some(FIRST_BURNCHAIN_BLOCK_HEIGHT)
+            Some(BITCOIN_REGTEST_FIRST_BLOCK_HEIGHT as u32)
         } else {
             None
         }
     }
     fn get_miner_address(&self, _id_bhh: &StacksBlockId) -> Option<StacksAddress> {
         None
-    }
-    fn get_total_liquid_ustx(&self, _id_bhh: &StacksBlockId) -> u128 {
-        0
     }
 }
 
@@ -365,20 +249,31 @@ impl<'a> ClarityDatabase<'a> {
 
     pub fn initialize(&mut self) {}
 
+    pub fn is_stack_empty(&self) -> bool {
+        self.store.depth() == 0
+    }
+
+    /// Nest the key-value wrapper instance
     pub fn begin(&mut self) {
         self.store.nest();
     }
 
+    /// Commit current key-value wrapper layer
     pub fn commit(&mut self) {
         self.store.commit();
     }
 
+    /// Drop current key-value wrapper layer
     pub fn roll_back(&mut self) {
         self.store.rollback();
     }
 
-    pub fn set_block_hash(&mut self, bhh: StacksBlockId) -> Result<StacksBlockId> {
-        self.store.set_block_hash(bhh)
+    pub fn set_block_hash(
+        &mut self,
+        bhh: StacksBlockId,
+        query_pending_data: bool,
+    ) -> Result<StacksBlockId> {
+        self.store.set_block_hash(bhh, query_pending_data)
     }
 
     pub fn put<T: ClaritySerializable>(&mut self, key: &str, value: &T) {
@@ -457,6 +352,15 @@ impl<'a> ClarityDatabase<'a> {
             .flatten()
     }
 
+    pub fn set_metadata(
+        &mut self,
+        contract_identifier: &QualifiedContractIdentifier,
+        key: &str,
+        data: &str,
+    ) {
+        self.store.insert_metadata(contract_identifier, key, data);
+    }
+
     fn insert_metadata<T: ClaritySerializable>(
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
@@ -485,6 +389,36 @@ impl<'a> ClarityDatabase<'a> {
         self.store
             .get_metadata(contract_identifier, key)
             .map(|x_opt| x_opt.map(|x| T::deserialize(&x)))
+    }
+
+    pub fn fetch_metadata_manual<T>(
+        &mut self,
+        at_height: u32,
+        contract_identifier: &QualifiedContractIdentifier,
+        key: &str,
+    ) -> Result<Option<T>>
+    where
+        T: ClarityDeserializable<T>,
+    {
+        self.store
+            .get_metadata_manual(at_height, contract_identifier, key)
+            .map(|x_opt| x_opt.map(|x| T::deserialize(&x)))
+    }
+
+    // load contract analysis stored by an analysis_db instance.
+    //   in unit testing, where the interpreter is invoked without
+    //   an analysis pass, this function will fail to find contract
+    //   analysis data
+    pub fn load_contract_analysis(
+        &mut self,
+        contract_identifier: &QualifiedContractIdentifier,
+    ) -> Option<ContractAnalysis> {
+        self.store
+            .get_metadata(contract_identifier, AnalysisDatabase::storage_key())
+            // treat NoSuchContract error thrown by get_metadata as an Option::None --
+            //    the analysis will propagate that as a CheckError anyways.
+            .ok()?
+            .map(|x| ContractAnalysis::deserialize(&x))
     }
 
     pub fn get_contract_size(
@@ -544,6 +478,47 @@ impl<'a> ClarityDatabase<'a> {
             "Failed to read non-consensus contract metadata, even though contract exists in MARF.",
         );
         Ok(data)
+    }
+
+    pub fn ustx_liquid_supply_key() -> &'static str {
+        "_stx-data::ustx_liquid_supply"
+    }
+
+    /// Returns the _current_ total liquid ustx
+    pub fn get_total_liquid_ustx(&mut self) -> u128 {
+        self.get_value(
+            ClarityDatabase::ustx_liquid_supply_key(),
+            &TypeSignature::UIntType,
+        )
+        .map(|v| v.expect_u128())
+        .unwrap_or(0)
+    }
+
+    fn set_ustx_liquid_supply(&mut self, set_to: u128) {
+        self.put(
+            ClarityDatabase::ustx_liquid_supply_key(),
+            &Value::UInt(set_to),
+        )
+    }
+
+    pub fn increment_ustx_liquid_supply(&mut self, incr_by: u128) -> Result<()> {
+        let current = self.get_total_liquid_ustx();
+        let next = current.checked_add(incr_by).ok_or_else(|| {
+            error!("Overflowed `ustx-liquid-supply`");
+            RuntimeErrorType::ArithmeticOverflow
+        })?;
+        self.set_ustx_liquid_supply(next);
+        Ok(())
+    }
+
+    pub fn decrement_ustx_liquid_supply(&mut self, decr_by: u128) -> Result<()> {
+        let current = self.get_total_liquid_ustx();
+        let next = current.checked_sub(decr_by).ok_or_else(|| {
+            error!("`stx-burn?` accepted that reduces `ustx-liquid-supply` below 0");
+            RuntimeErrorType::ArithmeticUnderflow
+        })?;
+        self.set_ustx_liquid_supply(next);
+        Ok(())
     }
 
     pub fn destroy(self) -> RollbackWrapper<'a> {
@@ -635,10 +610,106 @@ impl<'a> ClarityDatabase<'a> {
             .into()
     }
 
-    pub fn get_total_liquid_ustx(&mut self) -> u128 {
-        let cur_height = self.get_current_block_height();
-        let cur_id_bhh = self.get_index_block_header_hash(cur_height);
-        self.headers_db.get_total_liquid_ustx(&cur_id_bhh)
+    pub fn get_stx_btc_ops_processed(&mut self) -> u64 {
+        self.get("vm_pox::stx_btc_ops::processed_blocks")
+            .unwrap_or(0)
+    }
+
+    pub fn set_stx_btc_ops_processed(&mut self, processed: u64) {
+        self.put("vm_pox::stx_btc_ops::processed_blocks", &processed);
+    }
+}
+
+// poison-microblock
+
+impl<'a> ClarityDatabase<'a> {
+    pub fn make_microblock_pubkey_height_key(pubkey_hash: &Hash160) -> String {
+        format!("microblock-pubkey-hash::{}", pubkey_hash)
+    }
+
+    pub fn make_microblock_poison_key(height: u32) -> String {
+        format!("microblock-poison::{}", height)
+    }
+
+    pub fn insert_microblock_pubkey_hash_height(
+        &mut self,
+        pubkey_hash: &Hash160,
+        height: u32,
+    ) -> Result<()> {
+        let key = ClarityDatabase::make_microblock_pubkey_height_key(pubkey_hash);
+        let value = format!("{}", &height);
+        self.put(&key, &value);
+        Ok(())
+    }
+
+    pub fn insert_microblock_poison(
+        &mut self,
+        height: u32,
+        reporter: &StandardPrincipalData,
+        seq: u16,
+    ) -> Result<()> {
+        let key = ClarityDatabase::make_microblock_poison_key(height);
+        let value = Value::Tuple(
+            TupleData::from_data(vec![
+                (
+                    ClarityName::try_from("reporter").expect("BUG: valid string representation"),
+                    Value::Principal(PrincipalData::Standard(reporter.clone())),
+                ),
+                (
+                    ClarityName::try_from("sequence").expect("BUG: valid string representation"),
+                    Value::UInt(seq as u128),
+                ),
+            ])
+            .expect("BUG: valid tuple representation"),
+        );
+        let mut value_bytes = vec![];
+        value
+            .serialize_write(&mut value_bytes)
+            .expect("BUG: valid tuple representation did not serialize");
+
+        let value_str = to_hex(&value_bytes);
+        self.put(&key, &value_str);
+        Ok(())
+    }
+
+    pub fn get_microblock_pubkey_hash_height(&mut self, pubkey_hash: &Hash160) -> Option<u32> {
+        let key = ClarityDatabase::make_microblock_pubkey_height_key(pubkey_hash);
+        self.get(&key).map(|height_str: String| {
+            height_str
+                .parse::<u32>()
+                .expect("BUG: inserted non-u32 as height of microblock pubkey hash")
+        })
+    }
+
+    /// Returns (who-reported-the-poison-microblock, sequence-of-microblock-fork)
+    pub fn get_microblock_poison_report(
+        &mut self,
+        height: u32,
+    ) -> Option<(StandardPrincipalData, u16)> {
+        let key = ClarityDatabase::make_microblock_poison_key(height);
+        self.get(&key).map(|reporter_hex_str: String| {
+            let reporter_value = Value::try_deserialize_hex_untyped(&reporter_hex_str)
+                .expect("BUG: failed to decode serialized poison-microblock reporter");
+            let tuple_data = reporter_value.expect_tuple();
+            let reporter_value = tuple_data
+                .get("reporter")
+                .expect("BUG: poison-microblock report has no 'reporter'")
+                .to_owned();
+            let seq_value = tuple_data
+                .get("sequence")
+                .expect("BUG: poison-microblock report has no 'sequence'")
+                .to_owned();
+
+            let reporter_principal = reporter_value.expect_principal();
+            let seq_u128 = seq_value.expect_u128();
+
+            let seq: u16 = seq_u128.try_into().expect("BUG: seq exceeds u16 max");
+            if let PrincipalData::Standard(principal_data) = reporter_principal {
+                (principal_data, seq)
+            } else {
+                panic!("BUG: poison-microblock report principal is not a standard principal");
+            }
+        })
     }
 }
 
@@ -658,11 +729,12 @@ impl<'a> ClarityDatabase<'a> {
         contract_identifier: &QualifiedContractIdentifier,
         variable_name: &str,
         value_type: TypeSignature,
-    ) {
+    ) -> DataVariableMetadata {
         let variable_data = DataVariableMetadata { value_type };
         let key = ClarityDatabase::make_metadata_key(StoreType::VariableMeta, variable_name);
 
-        self.insert_metadata(contract_identifier, &key, &variable_data)
+        self.insert_metadata(contract_identifier, &key, &variable_data);
+        variable_data
     }
 
     pub fn load_variable(
@@ -676,15 +748,27 @@ impl<'a> ClarityDatabase<'a> {
             .ok_or(CheckErrors::NoSuchDataVariable(variable_name.to_string()).into())
     }
 
-    pub fn set_variable(
+    pub fn set_variable_unknown_descriptor(
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
         variable_name: &str,
         value: Value,
     ) -> Result<Value> {
-        let variable_descriptor = self.load_variable(contract_identifier, variable_name)?;
+        let descriptor = self.load_variable(contract_identifier, variable_name)?;
+        self.set_variable(contract_identifier, variable_name, value, &descriptor)
+    }
+
+    pub fn set_variable(
+        &mut self,
+        contract_identifier: &QualifiedContractIdentifier,
+        variable_name: &str,
+        value: Value,
+        variable_descriptor: &DataVariableMetadata,
+    ) -> Result<Value> {
         if !variable_descriptor.value_type.admits(&value) {
-            return Err(CheckErrors::TypeValueError(variable_descriptor.value_type, value).into());
+            return Err(
+                CheckErrors::TypeValueError(variable_descriptor.value_type.clone(), value).into(),
+            );
         }
 
         let key = ClarityDatabase::make_key_for_trip(
@@ -698,13 +782,21 @@ impl<'a> ClarityDatabase<'a> {
         return Ok(Value::Bool(true));
     }
 
-    pub fn lookup_variable(
+    pub fn lookup_variable_unknown_descriptor(
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
         variable_name: &str,
     ) -> Result<Value> {
-        let variable_descriptor = self.load_variable(contract_identifier, variable_name)?;
+        let descriptor = self.load_variable(contract_identifier, variable_name)?;
+        self.lookup_variable(contract_identifier, variable_name, &descriptor)
+    }
 
+    pub fn lookup_variable(
+        &mut self,
+        contract_identifier: &QualifiedContractIdentifier,
+        variable_name: &str,
+        variable_descriptor: &DataVariableMetadata,
+    ) -> Result<Value> {
         let key = ClarityDatabase::make_key_for_trip(
             contract_identifier,
             StoreType::Variable,
@@ -726,19 +818,18 @@ impl<'a> ClarityDatabase<'a> {
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
         map_name: &str,
-        key_type: TupleTypeSignature,
-        value_type: TupleTypeSignature,
-    ) {
-        let key_type = TypeSignature::from(key_type);
-        let value_type = TypeSignature::from(value_type);
-
+        key_type: TypeSignature,
+        value_type: TypeSignature,
+    ) -> DataMapMetadata {
         let data = DataMapMetadata {
             key_type,
             value_type,
         };
 
         let key = ClarityDatabase::make_metadata_key(StoreType::DataMapMeta, map_name);
-        self.insert_metadata(contract_identifier, &key, &data)
+        self.insert_metadata(contract_identifier, &key, &data);
+
+        data
     }
 
     pub fn load_map(
@@ -765,23 +856,35 @@ impl<'a> ClarityDatabase<'a> {
         )
     }
 
-    pub fn fetch_entry(
+    pub fn fetch_entry_unknown_descriptor(
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
         map_name: &str,
         key_value: &Value,
     ) -> Result<Value> {
-        let map_descriptor = self.load_map(contract_identifier, map_name)?;
+        let descriptor = self.load_map(contract_identifier, map_name)?;
+        self.fetch_entry(contract_identifier, map_name, key_value, &descriptor)
+    }
+
+    pub fn fetch_entry(
+        &mut self,
+        contract_identifier: &QualifiedContractIdentifier,
+        map_name: &str,
+        key_value: &Value,
+        map_descriptor: &DataMapMetadata,
+    ) -> Result<Value> {
         if !map_descriptor.key_type.admits(key_value) {
-            return Err(
-                CheckErrors::TypeValueError(map_descriptor.key_type, (*key_value).clone()).into(),
-            );
+            return Err(CheckErrors::TypeValueError(
+                map_descriptor.key_type.clone(),
+                (*key_value).clone(),
+            )
+            .into());
         }
 
         let key =
             ClarityDatabase::make_key_for_data_map_entry(contract_identifier, map_name, key_value);
 
-        let stored_type = TypeSignature::new_option(map_descriptor.value_type)?;
+        let stored_type = TypeSignature::new_option(map_descriptor.value_type.clone())?;
         let result = self.get_value(&key, &stored_type);
 
         match result {
@@ -796,8 +899,38 @@ impl<'a> ClarityDatabase<'a> {
         map_name: &str,
         key: Value,
         value: Value,
+        map_descriptor: &DataMapMetadata,
     ) -> Result<Value> {
-        self.inner_set_entry(contract_identifier, map_name, key, value, false)
+        self.inner_set_entry(
+            contract_identifier,
+            map_name,
+            key,
+            value,
+            false,
+            map_descriptor,
+        )
+    }
+
+    pub fn set_entry_unknown_descriptor(
+        &mut self,
+        contract_identifier: &QualifiedContractIdentifier,
+        map_name: &str,
+        key: Value,
+        value: Value,
+    ) -> Result<Value> {
+        let descriptor = self.load_map(contract_identifier, map_name)?;
+        self.set_entry(contract_identifier, map_name, key, value, &descriptor)
+    }
+
+    pub fn insert_entry_unknown_descriptor(
+        &mut self,
+        contract_identifier: &QualifiedContractIdentifier,
+        map_name: &str,
+        key: Value,
+        value: Value,
+    ) -> Result<Value> {
+        let descriptor = self.load_map(contract_identifier, map_name)?;
+        self.insert_entry(contract_identifier, map_name, key, value, &descriptor)
     }
 
     pub fn insert_entry(
@@ -806,8 +939,16 @@ impl<'a> ClarityDatabase<'a> {
         map_name: &str,
         key: Value,
         value: Value,
+        map_descriptor: &DataMapMetadata,
     ) -> Result<Value> {
-        self.inner_set_entry(contract_identifier, map_name, key, value, true)
+        self.inner_set_entry(
+            contract_identifier,
+            map_name,
+            key,
+            value,
+            true,
+            map_descriptor,
+        )
     }
 
     fn data_map_entry_exists(&mut self, key: &str, expected_value: &TypeSignature) -> Result<bool> {
@@ -824,13 +965,17 @@ impl<'a> ClarityDatabase<'a> {
         key_value: Value,
         value: Value,
         return_if_exists: bool,
+        map_descriptor: &DataMapMetadata,
     ) -> Result<Value> {
-        let map_descriptor = self.load_map(contract_identifier, map_name)?;
         if !map_descriptor.key_type.admits(&key_value) {
-            return Err(CheckErrors::TypeValueError(map_descriptor.key_type, key_value).into());
+            return Err(
+                CheckErrors::TypeValueError(map_descriptor.key_type.clone(), key_value).into(),
+            );
         }
         if !map_descriptor.value_type.admits(&value) {
-            return Err(CheckErrors::TypeValueError(map_descriptor.value_type, value).into());
+            return Err(
+                CheckErrors::TypeValueError(map_descriptor.value_type.clone(), value).into(),
+            );
         }
 
         let key = ClarityDatabase::make_key_for_quad(
@@ -839,7 +984,7 @@ impl<'a> ClarityDatabase<'a> {
             map_name,
             key_value.serialize(),
         );
-        let stored_type = TypeSignature::new_option(map_descriptor.value_type)?;
+        let stored_type = TypeSignature::new_option(map_descriptor.value_type.clone())?;
 
         if return_if_exists && self.data_map_entry_exists(&key, &stored_type)? {
             return Ok(Value::Bool(false));
@@ -856,12 +1001,14 @@ impl<'a> ClarityDatabase<'a> {
         contract_identifier: &QualifiedContractIdentifier,
         map_name: &str,
         key_value: &Value,
+        map_descriptor: &DataMapMetadata,
     ) -> Result<Value> {
-        let map_descriptor = self.load_map(contract_identifier, map_name)?;
         if !map_descriptor.key_type.admits(key_value) {
-            return Err(
-                CheckErrors::TypeValueError(map_descriptor.key_type, (*key_value).clone()).into(),
-            );
+            return Err(CheckErrors::TypeValueError(
+                map_descriptor.key_type.clone(),
+                (*key_value).clone(),
+            )
+            .into());
         }
 
         let key = ClarityDatabase::make_key_for_quad(
@@ -870,7 +1017,7 @@ impl<'a> ClarityDatabase<'a> {
             map_name,
             key_value.serialize(),
         );
-        let stored_type = TypeSignature::new_option(map_descriptor.value_type)?;
+        let stored_type = TypeSignature::new_option(map_descriptor.value_type.clone())?;
         if !self.data_map_entry_exists(&key, &stored_type)? {
             return Ok(Value::Bool(false));
         }
@@ -889,7 +1036,7 @@ impl<'a> ClarityDatabase<'a> {
         contract_identifier: &QualifiedContractIdentifier,
         token_name: &str,
         total_supply: &Option<u128>,
-    ) {
+    ) -> FungibleTokenMetadata {
         let data = FungibleTokenMetadata {
             total_supply: total_supply.clone(),
         };
@@ -898,17 +1045,17 @@ impl<'a> ClarityDatabase<'a> {
         self.insert_metadata(contract_identifier, &key, &data);
 
         // total supply _is_ included in the consensus hash
-        if total_supply.is_some() {
-            let supply_key = ClarityDatabase::make_key_for_trip(
-                contract_identifier,
-                StoreType::CirculatingSupply,
-                token_name,
-            );
-            self.put(&supply_key, &(0 as u128));
-        }
+        let supply_key = ClarityDatabase::make_key_for_trip(
+            contract_identifier,
+            StoreType::CirculatingSupply,
+            token_name,
+        );
+        self.put(&supply_key, &(0 as u128));
+
+        data
     }
 
-    fn load_ft(
+    pub fn load_ft(
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
         token_name: &str,
@@ -924,12 +1071,14 @@ impl<'a> ClarityDatabase<'a> {
         contract_identifier: &QualifiedContractIdentifier,
         token_name: &str,
         key_type: &TypeSignature,
-    ) {
+    ) -> NonFungibleTokenMetadata {
         let data = NonFungibleTokenMetadata {
             key_type: key_type.clone(),
         };
         let key = ClarityDatabase::make_metadata_key(StoreType::NonFungibleTokenMeta, token_name);
         self.insert_metadata(contract_identifier, &key, &data);
+
+        data
     }
 
     fn load_nft(
@@ -948,32 +1097,54 @@ impl<'a> ClarityDatabase<'a> {
         contract_identifier: &QualifiedContractIdentifier,
         token_name: &str,
         amount: u128,
+        descriptor: &FungibleTokenMetadata,
     ) -> Result<()> {
-        let descriptor = self.load_ft(contract_identifier, token_name)?;
+        let key = ClarityDatabase::make_key_for_trip(
+            contract_identifier,
+            StoreType::CirculatingSupply,
+            token_name,
+        );
+        let current_supply: u128 = self
+            .get(&key)
+            .expect("ERROR: Clarity VM failed to track token supply.");
+
+        let new_supply = current_supply
+            .checked_add(amount)
+            .ok_or(RuntimeErrorType::ArithmeticOverflow)?;
 
         if let Some(total_supply) = descriptor.total_supply {
-            let key = ClarityDatabase::make_key_for_trip(
-                contract_identifier,
-                StoreType::CirculatingSupply,
-                token_name,
-            );
-            let current_supply: u128 = self
-                .get(&key)
-                .expect("ERROR: Clarity VM failed to track token supply.");
-
-            let new_supply = current_supply
-                .checked_add(amount)
-                .ok_or(RuntimeErrorType::ArithmeticOverflow)?;
-
             if new_supply > total_supply {
-                Err(RuntimeErrorType::SupplyOverflow(new_supply, total_supply).into())
-            } else {
-                self.put(&key, &new_supply);
-                Ok(())
+                return Err(RuntimeErrorType::SupplyOverflow(new_supply, total_supply).into());
             }
-        } else {
-            Ok(())
         }
+
+        self.put(&key, &new_supply);
+        Ok(())
+    }
+
+    pub fn checked_decrease_token_supply(
+        &mut self,
+        contract_identifier: &QualifiedContractIdentifier,
+        token_name: &str,
+        amount: u128,
+    ) -> Result<()> {
+        let key = ClarityDatabase::make_key_for_trip(
+            contract_identifier,
+            StoreType::CirculatingSupply,
+            token_name,
+        );
+        let current_supply: u128 = self
+            .get(&key)
+            .expect("ERROR: Clarity VM failed to track token supply.");
+
+        if amount > current_supply {
+            return Err(RuntimeErrorType::SupplyUnderflow(current_supply, amount).into());
+        }
+
+        let new_supply = current_supply - amount;
+
+        self.put(&key, &new_supply);
+        Ok(())
     }
 
     pub fn get_ft_balance(
@@ -981,8 +1152,11 @@ impl<'a> ClarityDatabase<'a> {
         contract_identifier: &QualifiedContractIdentifier,
         token_name: &str,
         principal: &PrincipalData,
+        descriptor: Option<&FungibleTokenMetadata>,
     ) -> Result<u128> {
-        self.load_ft(contract_identifier, token_name)?;
+        if descriptor.is_none() {
+            self.load_ft(contract_identifier, token_name)?;
+        }
 
         let key = ClarityDatabase::make_key_for_quad(
             contract_identifier,
@@ -1016,15 +1190,31 @@ impl<'a> ClarityDatabase<'a> {
         Ok(())
     }
 
+    pub fn get_ft_supply(
+        &mut self,
+        contract_identifier: &QualifiedContractIdentifier,
+        token_name: &str,
+    ) -> Result<u128> {
+        let key = ClarityDatabase::make_key_for_trip(
+            contract_identifier,
+            StoreType::CirculatingSupply,
+            token_name,
+        );
+        let supply = self
+            .get(&key)
+            .expect("ERROR: Clarity VM failed to track token supply.");
+        Ok(supply)
+    }
+
     pub fn get_nft_owner(
         &mut self,
         contract_identifier: &QualifiedContractIdentifier,
         asset_name: &str,
         asset: &Value,
+        key_type: &TypeSignature,
     ) -> Result<PrincipalData> {
-        let descriptor = self.load_nft(contract_identifier, asset_name)?;
-        if !descriptor.key_type.admits(asset) {
-            return Err(CheckErrors::TypeValueError(descriptor.key_type, (*asset).clone()).into());
+        if !key_type.admits(asset) {
+            return Err(CheckErrors::TypeValueError(key_type.clone(), (*asset).clone()).into());
         }
 
         let key = ClarityDatabase::make_key_for_quad(
@@ -1034,8 +1224,18 @@ impl<'a> ClarityDatabase<'a> {
             asset.serialize(),
         );
 
-        let result = self.get(&key);
-        result.ok_or(RuntimeErrorType::NoSuchToken.into())
+        let value: Option<Value> = self.get(&key);
+        let owner = match value {
+            Some(owner) => owner.expect_optional(),
+            None => return Err(RuntimeErrorType::NoSuchToken.into()),
+        };
+
+        let principal = match owner {
+            Some(value) => value.expect_principal(),
+            None => return Err(RuntimeErrorType::NoSuchToken.into()),
+        };
+
+        Ok(principal)
     }
 
     pub fn get_nft_key_type(
@@ -1053,10 +1253,10 @@ impl<'a> ClarityDatabase<'a> {
         asset_name: &str,
         asset: &Value,
         principal: &PrincipalData,
+        key_type: &TypeSignature,
     ) -> Result<()> {
-        let descriptor = self.load_nft(contract_identifier, asset_name)?;
-        if !descriptor.key_type.admits(asset) {
-            return Err(CheckErrors::TypeValueError(descriptor.key_type, (*asset).clone()).into());
+        if !key_type.admits(asset) {
+            return Err(CheckErrors::TypeValueError(key_type.clone(), (*asset).clone()).into());
         }
 
         let key = ClarityDatabase::make_key_for_quad(
@@ -1066,8 +1266,31 @@ impl<'a> ClarityDatabase<'a> {
             asset.serialize(),
         );
 
-        self.put(&key, principal);
+        let value = Value::some(Value::Principal(principal.clone()))?;
+        self.put(&key, &value);
 
+        Ok(())
+    }
+
+    pub fn burn_nft(
+        &mut self,
+        contract_identifier: &QualifiedContractIdentifier,
+        asset_name: &str,
+        asset: &Value,
+        key_type: &TypeSignature,
+    ) -> Result<()> {
+        if !key_type.admits(asset) {
+            return Err(CheckErrors::TypeValueError(key_type.clone(), (*asset).clone()).into());
+        }
+
+        let key = ClarityDatabase::make_key_for_quad(
+            contract_identifier,
+            StoreType::NonFungibleToken,
+            asset_name,
+            asset.serialize(),
+        );
+
+        self.put(&key, &(Value::none()));
         Ok(())
     }
 }
@@ -1094,18 +1317,52 @@ impl<'a> ClarityDatabase<'a> {
         ClarityDatabase::make_key_for_account(principal, StoreType::PoxUnlockHeight)
     }
 
+    pub fn get_stx_balance_snapshot<'conn>(
+        &'conn mut self,
+        principal: &PrincipalData,
+    ) -> STXBalanceSnapshot<'a, 'conn> {
+        let stx_balance = self.get_account_stx_balance(principal);
+        let cur_burn_height = self.get_current_burnchain_block_height() as u64;
+
+        test_debug!("Balance of {} (raw={},locked={},unlock-height={},current-height={}) is {} (has_unlockable_tokens_at_burn_block={})",
+            principal,
+            stx_balance.amount_unlocked,
+            stx_balance.amount_locked,
+            stx_balance.unlock_height,
+            cur_burn_height,
+            stx_balance.get_available_balance_at_burn_block(cur_burn_height),
+            stx_balance.has_unlockable_tokens_at_burn_block(cur_burn_height));
+
+        STXBalanceSnapshot::new(principal, stx_balance, cur_burn_height, self)
+    }
+
+    pub fn get_stx_balance_snapshot_genesis<'conn>(
+        &'conn mut self,
+        principal: &PrincipalData,
+    ) -> STXBalanceSnapshot<'a, 'conn> {
+        let stx_balance = self.get_account_stx_balance(principal);
+        let cur_burn_height = 0;
+
+        test_debug!("Balance of {} (raw={},locked={},unlock-height={},current-height={}) is {} (has_unlockable_tokens_at_burn_block={})",
+            principal,
+            stx_balance.amount_unlocked,
+            stx_balance.amount_locked,
+            stx_balance.unlock_height,
+            cur_burn_height,
+            stx_balance.get_available_balance_at_burn_block(cur_burn_height),
+            stx_balance.has_unlockable_tokens_at_burn_block(cur_burn_height));
+
+        STXBalanceSnapshot::new(principal, stx_balance, cur_burn_height, self)
+    }
+
     pub fn get_account_stx_balance(&mut self, principal: &PrincipalData) -> STXBalance {
         let key = ClarityDatabase::make_key_for_account_balance(principal);
+        debug!("Fetching account balance"; "principal" => %principal.to_string());
         let result = self.get(&key);
         match result {
             None => STXBalance::zero(),
             Some(balance) => balance,
         }
-    }
-
-    pub fn set_account_stx_balance(&mut self, principal: &PrincipalData, balance: &STXBalance) {
-        let key = ClarityDatabase::make_key_for_account_balance(principal);
-        self.put(&key, balance);
     }
 
     pub fn get_account_nonce(&mut self, principal: &PrincipalData) -> u64 {

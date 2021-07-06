@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -16,17 +16,26 @@
 
 use std::cmp;
 use std::convert::{TryFrom, TryInto};
+use vm::costs::cost_functions::ClarityCostFunction;
+use vm::costs::{CostTracker, MemoryConsumer};
 
-use vm::contexts::GlobalContext;
+use vm::contexts::{Environment, GlobalContext};
 use vm::errors::Error;
 use vm::errors::{CheckErrors, InterpreterError, InterpreterResult as Result, RuntimeErrorType};
-use vm::representations::{SymbolicExpression, SymbolicExpressionType};
-use vm::types::{PrincipalData, QualifiedContractIdentifier, Value};
+use vm::representations::{ClarityName, SymbolicExpression, SymbolicExpressionType};
+use vm::types::{
+    BuffData, PrincipalData, QualifiedContractIdentifier, SequenceData, TupleData, TypeSignature,
+    Value,
+};
 
-use chainstate::stacks::boot::boot_code_id;
+use crate::types::chainstate::StacksMicroblockHeader;
+use crate::util::boot::boot_code_id;
 use chainstate::stacks::db::StacksChainState;
 use chainstate::stacks::events::{STXEventType, STXLockEventData, StacksTransactionEvent};
-use vm::clarity::ClarityTransactionConnection;
+
+use util::hash::Hash160;
+
+use crate::vm::costs::runtime_cost;
 
 fn parse_pox_stacking_result(
     result: &Value,
@@ -71,10 +80,17 @@ fn handle_pox_api_contract_call(
     if function_name == "stack-stx" || function_name == "delegate-stack-stx" {
         debug!(
             "Handle special-case contract-call to {:?} {} (which returned {:?})",
-            boot_code_id("pox"),
+            boot_code_id("pox", global_context.mainnet),
             function_name,
             value
         );
+
+        // applying a pox lock at this point is equivalent to evaluating a transfer
+        runtime_cost(
+            ClarityCostFunction::StxTransfer,
+            &mut global_context.cost_track,
+            1,
+        )?;
 
         match parse_pox_stacking_result(value) {
             Ok((stacker, locked_amount, unlock_height)) => {
@@ -92,6 +108,7 @@ fn handle_pox_api_contract_call(
                                 STXEventType::STXLockEvent(STXLockEventData {
                                     locked_amount,
                                     unlock_height,
+                                    locked_address: stacker,
                                 }),
                             ));
                         }
@@ -124,7 +141,7 @@ pub fn handle_contract_call_special_cases(
     function_name: &str,
     result: &Value,
 ) -> Result<()> {
-    if *contract_id == boot_code_id("pox") {
+    if *contract_id == boot_code_id("pox", global_context.mainnet) {
         return handle_pox_api_contract_call(global_context, sender, function_name, result);
     }
     // TODO: insert more special cases here, as needed

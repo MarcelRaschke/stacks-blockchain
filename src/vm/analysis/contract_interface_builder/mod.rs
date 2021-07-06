@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -38,6 +38,7 @@ pub fn build_contract_interface(contract_analysis: &ContractAnalysis) -> Contrac
         type_map: _,
         cost_track: _,
         contract_interface: _,
+        is_cost_contract_eligible: _,
     } = contract_analysis;
 
     contract_interface
@@ -329,8 +330,8 @@ impl ContractInterfaceVariable {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContractInterfaceMap {
     pub name: String,
-    pub key: Vec<ContractInterfaceTupleEntryType>,
-    pub value: Vec<ContractInterfaceTupleEntryType>,
+    pub key: ContractInterfaceAtomType,
+    pub value: ContractInterfaceAtomType,
 }
 
 impl ContractInterfaceMap {
@@ -338,26 +339,10 @@ impl ContractInterfaceMap {
         map: &BTreeMap<ClarityName, (TypeSignature, TypeSignature)>,
     ) -> Vec<ContractInterfaceMap> {
         map.iter()
-            .map(|(name, (key_sig, val_sig))| {
-                let key_type = match key_sig {
-                    TypeSignature::TupleType(tuple_sig) => {
-                        ContractInterfaceAtomType::vec_from_tuple_type(&tuple_sig)
-                    }
-                    _ => panic!("Contract map key should always be a tuple type!"),
-                };
-
-                let val_type = match val_sig {
-                    TypeSignature::TupleType(tuple_sig) => {
-                        ContractInterfaceAtomType::vec_from_tuple_type(&tuple_sig)
-                    }
-                    _ => panic!("Contract map value should always be a tuple type!"),
-                };
-
-                ContractInterfaceMap {
-                    name: name.clone().into(),
-                    key: key_type,
-                    value: val_type,
-                }
+            .map(|(name, (key_sig, val_sig))| ContractInterfaceMap {
+                name: name.clone().into(),
+                key: ContractInterfaceAtomType::from_type_signature(key_sig),
+                value: ContractInterfaceAtomType::from_type_signature(val_sig),
             })
             .collect()
     }

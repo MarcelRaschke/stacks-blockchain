@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,16 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-pub mod address;
-pub mod auth;
-pub mod block;
-pub mod boot;
-pub mod db;
-pub mod events;
-pub mod index;
-pub mod miner;
-pub mod transaction;
-
 use std::convert::From;
 use std::convert::TryFrom;
 use std::error;
@@ -34,7 +24,20 @@ use std::io::{Read, Write};
 use std::ops::Deref;
 use std::ops::DerefMut;
 
+use rusqlite::Error as RusqliteError;
 use sha2::{Digest, Sha512Trunc256};
+
+use crate::codec::MAX_MESSAGE_LEN;
+use address::AddressHashMode;
+use burnchains::Txid;
+use chainstate::burn::operations::LeaderBlockCommitOp;
+use chainstate::burn::ConsensusHash;
+use chainstate::stacks::db::accounts::MinerReward;
+use chainstate::stacks::db::blocks::MemPoolRejection;
+use chainstate::stacks::db::StacksHeaderInfo;
+use chainstate::stacks::index::Error as marf_error;
+use clarity_vm::clarity::Error as clarity_error;
+use net::Error as net_error;
 use util::db::DBConn;
 use util::db::Error as db_error;
 use util::hash::Hash160;
@@ -44,31 +47,29 @@ use util::secp256k1;
 use util::secp256k1::MessageSignature;
 use util::strings::StacksString;
 use util::vrf::VRFProof;
-
-use address::AddressHashMode;
-use burnchains::BurnchainHeaderHash;
-use burnchains::Txid;
-use chainstate::burn::operations::LeaderBlockCommitOp;
-use chainstate::burn::{BlockHeaderHash, ConsensusHash};
-
-use chainstate::stacks::db::accounts::MinerReward;
-use chainstate::stacks::db::StacksHeaderInfo;
-use chainstate::stacks::index::Error as marf_error;
-use chainstate::stacks::index::{TrieHash, TRIEHASH_ENCODED_SIZE};
-
-use chainstate::stacks::db::blocks::MemPoolRejection;
-use net::codec::{read_next, write_next};
-use net::Error as net_error;
-use net::{StacksMessageCodec, MAX_MESSAGE_LEN};
-use rusqlite::Error as RusqliteError;
-
+use vm::contexts::GlobalContext;
+use vm::costs::CostErrors;
+use vm::costs::ExecutionCost;
+use vm::errors::Error as clarity_interpreter_error;
+use vm::representations::{ClarityName, ContractName};
 use vm::types::{PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, Value};
 
-use vm::errors::Error as clarity_interpreter_error;
+use crate::codec::{read_next, write_next, Error as codec_error, StacksMessageCodec};
+use crate::types::chainstate::{
+    BlockHeaderHash, BurnchainHeaderHash, StacksAddress, StacksWorkScore,
+};
+use crate::types::chainstate::{StacksBlockHeader, StacksBlockId, StacksMicroblockHeader};
+use crate::types::proof::{TrieHash, TRIEHASH_ENCODED_SIZE};
 
-use vm::clarity::Error as clarity_error;
-use vm::costs::ExecutionCost;
-use vm::representations::{ClarityName, ContractName};
+pub mod address;
+pub mod auth;
+pub mod block;
+pub mod boot;
+pub mod db;
+pub mod events;
+pub mod index;
+pub mod miner;
+pub mod transaction;
 
 pub type StacksPublicKey = secp256k1::Secp256k1PublicKey;
 pub type StacksPrivateKey = secp256k1::Secp256k1PrivateKey;
@@ -84,15 +85,8 @@ pub const C32_ADDRESS_VERSION_TESTNET_MULTISIG: u8 = 21; // N
 pub const STACKS_BLOCK_VERSION: u8 = 0;
 pub const STACKS_MICROBLOCK_VERSION: u8 = 0;
 
-pub const MAX_TRANSACTION_LEN: u32 = MAX_MESSAGE_LEN; // TODO: shrink
-pub const MAX_BLOCK_LEN: u32 = MAX_MESSAGE_LEN; // TODO: shrink
-
-pub struct StacksBlockId(pub [u8; 32]);
-impl_array_newtype!(StacksBlockId, u8, 32);
-impl_array_hexstring_fmt!(StacksBlockId);
-impl_byte_array_newtype!(StacksBlockId, u8, 32);
-impl_byte_array_from_column!(StacksBlockId);
-impl_byte_array_serde!(StacksBlockId);
+pub const MAX_BLOCK_LEN: u32 = 2 * 1024 * 1024;
+pub const MAX_TRANSACTION_LEN: u32 = MAX_BLOCK_LEN;
 
 impl StacksBlockId {
     pub fn new(
@@ -134,6 +128,15 @@ impl AddressHashMode {
             _ => C32_ADDRESS_VERSION_TESTNET_MULTISIG,
         }
     }
+
+    pub fn from_version(version: u8) -> AddressHashMode {
+        match version {
+            C32_ADDRESS_VERSION_TESTNET_SINGLESIG | C32_ADDRESS_VERSION_MAINNET_SINGLESIG => {
+                AddressHashMode::SerializeP2PKH
+            }
+            _ => AddressHashMode::SerializeP2SH,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -146,6 +149,7 @@ pub enum Error {
     NoSuchBlockError,
     InvalidChainstateDB,
     BlockTooBigError,
+    TransactionTooBigError,
     BlockCostExceeded,
     NoTransactionsToMine,
     MicroblockStreamTooLongError,
@@ -154,6 +158,7 @@ pub enum Error {
     ClarityError(clarity_error),
     DBError(db_error),
     NetError(net_error),
+    CodecError(codec_error),
     MARFError(marf_error),
     ReadError(io::Error),
     WriteError(io::Error),
@@ -169,6 +174,24 @@ impl From<marf_error> for Error {
     }
 }
 
+impl From<clarity_error> for Error {
+    fn from(e: clarity_error) -> Error {
+        Error::ClarityError(e)
+    }
+}
+
+impl From<net_error> for Error {
+    fn from(e: net_error) -> Error {
+        Error::NetError(e)
+    }
+}
+
+impl From<codec_error> for Error {
+    fn from(e: codec_error) -> Error {
+        Error::CodecError(e)
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
@@ -180,6 +203,7 @@ impl fmt::Display for Error {
             Error::NoSuchBlockError => write!(f, "No such Stacks block"),
             Error::InvalidChainstateDB => write!(f, "Invalid chainstate database"),
             Error::BlockTooBigError => write!(f, "Too much data in block"),
+            Error::TransactionTooBigError => write!(f, "Too much data in transaction"),
             Error::BlockCostExceeded => write!(f, "Block execution budget exceeded"),
             Error::MicroblockStreamTooLongError => write!(f, "Too many microblocks in stream"),
             Error::IncompatibleSpendingConditionError => {
@@ -196,6 +220,7 @@ impl fmt::Display for Error {
             Error::ClarityError(ref e) => fmt::Display::fmt(e, f),
             Error::DBError(ref e) => fmt::Display::fmt(e, f),
             Error::NetError(ref e) => fmt::Display::fmt(e, f),
+            Error::CodecError(ref e) => fmt::Display::fmt(e, f),
             Error::MARFError(ref e) => fmt::Display::fmt(e, f),
             Error::ReadError(ref e) => fmt::Display::fmt(e, f),
             Error::WriteError(ref e) => fmt::Display::fmt(e, f),
@@ -219,6 +244,7 @@ impl error::Error for Error {
             Error::NoSuchBlockError => None,
             Error::InvalidChainstateDB => None,
             Error::BlockTooBigError => None,
+            Error::TransactionTooBigError => None,
             Error::BlockCostExceeded => None,
             Error::MicroblockStreamTooLongError => None,
             Error::IncompatibleSpendingConditionError => None,
@@ -226,6 +252,7 @@ impl error::Error for Error {
             Error::ClarityError(ref e) => Some(e),
             Error::DBError(ref e) => Some(e),
             Error::NetError(ref e) => Some(e),
+            Error::CodecError(ref e) => Some(e),
             Error::MARFError(ref e) => Some(e),
             Error::ReadError(ref e) => Some(e),
             Error::WriteError(ref e) => Some(e),
@@ -249,6 +276,7 @@ impl Error {
             Error::NoSuchBlockError => "NoSuchBlockError",
             Error::InvalidChainstateDB => "InvalidChainstateDB",
             Error::BlockTooBigError => "BlockTooBigError",
+            Error::TransactionTooBigError => "TransactionTooBigError",
             Error::BlockCostExceeded => "BlockCostExceeded",
             Error::MicroblockStreamTooLongError => "MicroblockStreamTooLongError",
             Error::IncompatibleSpendingConditionError => "IncompatibleSpendingConditionError",
@@ -256,6 +284,7 @@ impl Error {
             Error::ClarityError(ref _e) => "ClarityError",
             Error::DBError(ref _e) => "DBError",
             Error::NetError(ref _e) => "NetError",
+            Error::CodecError(ref _e) => "CodecError",
             Error::MARFError(ref _e) => "MARFError",
             Error::ReadError(ref _e) => "ReadError",
             Error::WriteError(ref _e) => "WriteError",
@@ -297,6 +326,25 @@ impl From<clarity_interpreter_error> for Error {
     }
 }
 
+impl Error {
+    pub fn from_cost_error(
+        err: CostErrors,
+        cost_before: ExecutionCost,
+        context: &GlobalContext,
+    ) -> Error {
+        match err {
+            CostErrors::CostBalanceExceeded(used, budget) => {
+                Error::CostOverflowError(cost_before, used, budget)
+            }
+            _ => {
+                let cur_cost = context.cost_track.get_total();
+                let budget = context.cost_track.get_limit();
+                Error::CostOverflowError(cost_before, cur_cost, budget)
+            }
+        }
+    }
+}
+
 impl Txid {
     /// A Stacks transaction ID is a sha512/256 hash (not a double-sha256 hash)
     pub fn from_stacks_tx(txdata: &[u8]) -> Txid {
@@ -311,14 +359,6 @@ impl Txid {
         Txid::from_stacks_tx(txdata)
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Copy, Serialize, Deserialize, Hash)]
-pub struct StacksAddress {
-    pub version: u8,
-    pub bytes: Hash160,
-}
-
-pub const STACKS_ADDRESS_ENCODED_SIZE: u32 = 1 + HASH160_ENCODED_SIZE;
 
 /// How a transaction may be appended to the Stacks blockchain
 #[repr(u8)]
@@ -504,8 +544,8 @@ impl MultisigHashMode {
 pub struct MultisigSpendingCondition {
     pub hash_mode: MultisigHashMode,
     pub signer: Hash160,
-    pub nonce: u64,    // nth authorization from this account
-    pub fee_rate: u64, // microSTX/compute rate offered by this account
+    pub nonce: u64,  // nth authorization from this account
+    pub tx_fee: u64, // microSTX/compute rate offered by this account
     pub fields: Vec<TransactionAuthField>,
     pub signatures_required: u16,
 }
@@ -514,8 +554,8 @@ pub struct MultisigSpendingCondition {
 pub struct SinglesigSpendingCondition {
     pub hash_mode: SinglesigHashMode,
     pub signer: Hash160,
-    pub nonce: u64,    // nth authorization from this account
-    pub fee_rate: u64, // microSTX/compute rate offerred by this account
+    pub nonce: u64,  // nth authorization from this account
+    pub tx_fee: u64, // microSTX/compute rate offerred by this account
     pub key_encoding: TransactionPublicKeyEncoding,
     pub signature: MessageSignature,
 }
@@ -783,43 +823,12 @@ pub struct StacksTransactionSigner {
     check_overlap: bool,
 }
 
-/// How much work has gone into this chain so far?
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct StacksWorkScore {
-    pub burn: u64, // number of burn tokens destroyed
-    pub work: u64, // in Stacks, "work" == the length of the fork
-}
-
-/// The header for an on-chain-anchored Stacks block
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct StacksBlockHeader {
-    pub version: u8,
-    pub total_work: StacksWorkScore, // NOTE: this is the work done on the chain tip this block builds on (i.e. take this from the parent)
-    pub proof: VRFProof,
-    pub parent_block: BlockHeaderHash, // NOTE: even though this is also present in the burn chain, we need this here for super-light clients that don't even have burn chain headers
-    pub parent_microblock: BlockHeaderHash,
-    pub parent_microblock_sequence: u16,
-    pub tx_merkle_root: Sha512Trunc256Sum,
-    pub state_index_root: TrieHash,
-    pub microblock_pubkey_hash: Hash160, // we'll get the public key back from the first signature (note that this is the Hash160 of the _compressed_ public key)
-}
-
 /// A block that contains blockchain-anchored data
 /// (corresponding to a LeaderBlockCommitOp)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StacksBlock {
     pub header: StacksBlockHeader,
     pub txs: Vec<StacksTransaction>,
-}
-
-/// Header structure for a microblock
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StacksMicroblockHeader {
-    pub version: u8,
-    pub sequence: u16,
-    pub prev_block: BlockHeaderHash,
-    pub tx_merkle_root: Sha512Trunc256Sum,
-    pub signature: MessageSignature,
 }
 
 /// A microblock that contains non-blockchain-anchored data,
@@ -848,7 +857,8 @@ pub struct StacksBlockBuilder {
     bytes_so_far: u64,
     prev_microblock_header: StacksMicroblockHeader,
     miner_privkey: StacksPrivateKey,
-    miner_payouts: Option<Vec<MinerReward>>,
+    miner_payouts: Option<(MinerReward, Vec<MinerReward>, MinerReward)>,
+    parent_microblock_hash: Option<BlockHeaderHash>,
     miner_id: usize,
 }
 
@@ -861,19 +871,17 @@ pub const MAX_MICROBLOCK_SIZE: u32 = 65536;
 
 #[cfg(test)]
 pub mod test {
-    use super::*;
+    use chainstate::stacks::StacksPublicKey as PubKey;
     use chainstate::stacks::*;
     use core::*;
     use net::codec::test::check_codec_and_corruption;
     use net::codec::*;
     use net::*;
-
-    use chainstate::stacks::StacksPublicKey as PubKey;
-
     use util::hash::*;
     use util::log;
-
     use vm::representations::{ClarityName, ContractName};
+
+    use super::*;
 
     /// Make a representative of each kind of transaction we support
     pub fn codec_all_transactions(
@@ -920,7 +928,7 @@ pub mod test {
                 hash_mode: SinglesigHashMode::P2PKH,
                 key_encoding: TransactionPublicKeyEncoding::Uncompressed,
                 nonce: 123,
-                fee_rate: 456,
+                tx_fee: 456,
                 signature: MessageSignature::from_raw(&vec![0xff; 65])
             }),
             TransactionSpendingCondition::Singlesig(SinglesigSpendingCondition {
@@ -928,14 +936,14 @@ pub mod test {
                 hash_mode: SinglesigHashMode::P2PKH,
                 key_encoding: TransactionPublicKeyEncoding::Compressed,
                 nonce: 234,
-                fee_rate: 567,
+                tx_fee: 567,
                 signature: MessageSignature::from_raw(&vec![0xff; 65])
             }),
             TransactionSpendingCondition::Multisig(MultisigSpendingCondition {
                 signer: Hash160([0x11; 20]),
                 hash_mode: MultisigHashMode::P2SH,
                 nonce: 345,
-                fee_rate: 678,
+                tx_fee: 678,
                 fields: vec![
                     TransactionAuthField::Signature(TransactionPublicKeyEncoding::Uncompressed, MessageSignature::from_raw(&vec![0xff; 65])),
                     TransactionAuthField::Signature(TransactionPublicKeyEncoding::Uncompressed, MessageSignature::from_raw(&vec![0xfe; 65])),
@@ -947,7 +955,7 @@ pub mod test {
                 signer: Hash160([0x11; 20]),
                 hash_mode: MultisigHashMode::P2SH,
                 nonce: 456,
-                fee_rate: 789,
+                tx_fee: 789,
                 fields: vec![
                     TransactionAuthField::Signature(TransactionPublicKeyEncoding::Compressed, MessageSignature::from_raw(&vec![0xff; 65])),
                     TransactionAuthField::Signature(TransactionPublicKeyEncoding::Compressed, MessageSignature::from_raw(&vec![0xfe; 65])),
@@ -960,14 +968,14 @@ pub mod test {
                 hash_mode: SinglesigHashMode::P2WPKH,
                 key_encoding: TransactionPublicKeyEncoding::Compressed,
                 nonce: 567,
-                fee_rate: 890,
+                tx_fee: 890,
                 signature: MessageSignature::from_raw(&vec![0xfe; 65]),
             }),
             TransactionSpendingCondition::Multisig(MultisigSpendingCondition {
                 signer: Hash160([0x11; 20]),
                 hash_mode: MultisigHashMode::P2WSH,
                 nonce: 678,
-                fee_rate: 901,
+                tx_fee: 901,
                 fields: vec![
                     TransactionAuthField::Signature(TransactionPublicKeyEncoding::Compressed, MessageSignature::from_raw(&vec![0xff; 65])),
                     TransactionAuthField::Signature(TransactionPublicKeyEncoding::Compressed, MessageSignature::from_raw(&vec![0xfe; 65])),

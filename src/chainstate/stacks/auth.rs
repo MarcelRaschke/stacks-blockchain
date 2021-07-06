@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -18,11 +18,8 @@ use std::io;
 use std::io::prelude::*;
 use std::io::{Read, Write};
 
-use net::codec::{read_next, write_next};
-use net::Error as net_error;
-use net::StacksMessageCodec;
-use net::MAX_MESSAGE_LEN;
-
+use crate::codec::MAX_MESSAGE_LEN;
+use crate::types::StacksPublicKeyBuffer;
 use address::public_keys_to_address_hash;
 use address::AddressHashMode;
 use burnchains::PrivateKey;
@@ -33,7 +30,6 @@ use chainstate::stacks::MultisigHashMode;
 use chainstate::stacks::MultisigSpendingCondition;
 use chainstate::stacks::SinglesigHashMode;
 use chainstate::stacks::SinglesigSpendingCondition;
-use chainstate::stacks::StacksAddress;
 use chainstate::stacks::StacksPrivateKey;
 use chainstate::stacks::StacksPublicKey;
 use chainstate::stacks::TransactionAuth;
@@ -46,7 +42,7 @@ use chainstate::stacks::{
     C32_ADDRESS_VERSION_MAINNET_MULTISIG, C32_ADDRESS_VERSION_MAINNET_SINGLESIG,
     C32_ADDRESS_VERSION_TESTNET_MULTISIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
 };
-use net::StacksPublicKeyBuffer;
+use net::Error as net_error;
 use net::STACKS_PUBLIC_KEY_ENCODED_SIZE;
 use util::hash::to_hex;
 use util::hash::Hash160;
@@ -56,8 +52,11 @@ use util::retry::RetryReader;
 use util::secp256k1::MessageSignature;
 use util::secp256k1::MESSAGE_SIGNATURE_ENCODED_SIZE;
 
+use crate::codec::{read_next, write_next, Error as codec_error, StacksMessageCodec};
+use crate::types::chainstate::StacksAddress;
+
 impl StacksMessageCodec for TransactionAuthField {
-    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), net_error> {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
         match *self {
             TransactionAuthField::PublicKey(ref pubk) => {
                 let field_id = if pubk.compressed() {
@@ -85,7 +84,7 @@ impl StacksMessageCodec for TransactionAuthField {
         Ok(())
     }
 
-    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<TransactionAuthField, net_error> {
+    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<TransactionAuthField, codec_error> {
         let field_id: u8 = read_next(fd)?;
         let field = match field_id {
             x if x == TransactionAuthFieldID::PublicKeyCompressed as u8 => {
@@ -112,7 +111,7 @@ impl StacksMessageCodec for TransactionAuthField {
             }
             _ => {
                 test_debug!("Failed to deserialize auth field ID {}", field_id);
-                return Err(net_error::DeserializeError(format!(
+                return Err(codec_error::DeserializeError(format!(
                     "Failed to parse auth field: unkonwn auth field ID {}",
                     field_id
                 )));
@@ -123,27 +122,30 @@ impl StacksMessageCodec for TransactionAuthField {
 }
 
 impl StacksMessageCodec for MultisigSpendingCondition {
-    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), net_error> {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
         write_next(fd, &(self.hash_mode.clone() as u8))?;
         write_next(fd, &self.signer)?;
         write_next(fd, &self.nonce)?;
-        write_next(fd, &self.fee_rate)?;
+        write_next(fd, &self.tx_fee)?;
         write_next(fd, &self.fields)?;
         write_next(fd, &self.signatures_required)?;
         Ok(())
     }
 
-    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<MultisigSpendingCondition, net_error> {
+    fn consensus_deserialize<R: Read>(
+        fd: &mut R,
+    ) -> Result<MultisigSpendingCondition, codec_error> {
         let hash_mode_u8: u8 = read_next(fd)?;
-        let hash_mode =
-            MultisigHashMode::from_u8(hash_mode_u8).ok_or(net_error::DeserializeError(format!(
+        let hash_mode = MultisigHashMode::from_u8(hash_mode_u8).ok_or(
+            codec_error::DeserializeError(format!(
                 "Failed to parse multisig spending condition: unknown hash mode {}",
                 hash_mode_u8
-            )))?;
+            )),
+        )?;
 
         let signer: Hash160 = read_next(fd)?;
         let nonce: u64 = read_next(fd)?;
-        let fee_rate: u64 = read_next(fd)?;
+        let tx_fee: u64 = read_next(fd)?;
         let fields: Vec<TransactionAuthField> = {
             let mut bound_read = BoundReader::from_reader(fd, MAX_MESSAGE_LEN as u64);
             read_next(&mut bound_read)
@@ -160,7 +162,7 @@ impl StacksMessageCodec for MultisigSpendingCondition {
                     num_sigs_given =
                         num_sigs_given
                             .checked_add(1)
-                            .ok_or(net_error::DeserializeError(
+                            .ok_or(codec_error::DeserializeError(
                                 "Failed to parse multisig spending condition: too many signatures"
                                     .to_string(),
                             ))?;
@@ -183,7 +185,7 @@ impl StacksMessageCodec for MultisigSpendingCondition {
                 num_sigs_given,
                 signatures_required
             );
-            return Err(net_error::DeserializeError(format!(
+            return Err(codec_error::DeserializeError(format!(
                 "Failed to parse multisig spending condition: got {} sigs, expected {}",
                 num_sigs_given, signatures_required
             )));
@@ -194,7 +196,7 @@ impl StacksMessageCodec for MultisigSpendingCondition {
             test_debug!(
                 "Failed to deserialize multisig spending condition: expected compressed keys only"
             );
-            return Err(net_error::DeserializeError(
+            return Err(codec_error::DeserializeError(
                 "Failed to parse multisig spending condition: expected compressed keys only"
                     .to_string(),
             ));
@@ -203,7 +205,7 @@ impl StacksMessageCodec for MultisigSpendingCondition {
         Ok(MultisigSpendingCondition {
             signer,
             nonce,
-            fee_rate,
+            tx_fee,
             hash_mode,
             fields,
             signatures_required,
@@ -272,7 +274,7 @@ impl MultisigSpendingCondition {
                     let (pubkey, next_sighash) = TransactionSpendingCondition::next_verification(
                         &cur_sighash,
                         cond_code,
-                        self.fee_rate,
+                        self.tx_fee,
                         self.nonce,
                         pubkey_encoding,
                         sigbuf,
@@ -325,20 +327,22 @@ impl MultisigSpendingCondition {
 }
 
 impl StacksMessageCodec for SinglesigSpendingCondition {
-    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), net_error> {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
         write_next(fd, &(self.hash_mode.clone() as u8))?;
         write_next(fd, &self.signer)?;
         write_next(fd, &self.nonce)?;
-        write_next(fd, &self.fee_rate)?;
+        write_next(fd, &self.tx_fee)?;
         write_next(fd, &(self.key_encoding.clone() as u8))?;
         write_next(fd, &self.signature)?;
         Ok(())
     }
 
-    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<SinglesigSpendingCondition, net_error> {
+    fn consensus_deserialize<R: Read>(
+        fd: &mut R,
+    ) -> Result<SinglesigSpendingCondition, codec_error> {
         let hash_mode_u8: u8 = read_next(fd)?;
         let hash_mode = SinglesigHashMode::from_u8(hash_mode_u8).ok_or(
-            net_error::DeserializeError(format!(
+            codec_error::DeserializeError(format!(
                 "Failed to parse singlesig spending condition: unknown hash mode {}",
                 hash_mode_u8
             )),
@@ -346,11 +350,11 @@ impl StacksMessageCodec for SinglesigSpendingCondition {
 
         let signer: Hash160 = read_next(fd)?;
         let nonce: u64 = read_next(fd)?;
-        let fee_rate: u64 = read_next(fd)?;
+        let tx_fee: u64 = read_next(fd)?;
 
         let key_encoding_u8: u8 = read_next(fd)?;
         let key_encoding = TransactionPublicKeyEncoding::from_u8(key_encoding_u8).ok_or(
-            net_error::DeserializeError(format!(
+            codec_error::DeserializeError(format!(
                 "Failed to parse singlesig spending condition: unknown key encoding {}",
                 key_encoding_u8
             )),
@@ -363,13 +367,13 @@ impl StacksMessageCodec for SinglesigSpendingCondition {
             && key_encoding != TransactionPublicKeyEncoding::Compressed
         {
             test_debug!("Incompatible hashing mode and key encoding");
-            return Err(net_error::DeserializeError("Failed to parse singlesig spending condition: incomaptible hash mode and key encoding".to_string()));
+            return Err(codec_error::DeserializeError("Failed to parse singlesig spending condition: incomaptible hash mode and key encoding".to_string()));
         }
 
         Ok(SinglesigSpendingCondition {
             signer: signer,
             nonce: nonce,
-            fee_rate: fee_rate,
+            tx_fee: tx_fee,
             hash_mode: hash_mode,
             key_encoding: key_encoding,
             signature: signature,
@@ -430,7 +434,7 @@ impl SinglesigSpendingCondition {
         let (pubkey, next_sighash) = TransactionSpendingCondition::next_verification(
             initial_sighash,
             cond_code,
-            self.fee_rate,
+            self.tx_fee,
             self.nonce,
             &self.key_encoding,
             &self.signature,
@@ -461,7 +465,7 @@ impl SinglesigSpendingCondition {
 }
 
 impl StacksMessageCodec for TransactionSpendingCondition {
-    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), net_error> {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
         match *self {
             TransactionSpendingCondition::Singlesig(ref data) => {
                 data.consensus_serialize(fd)?;
@@ -475,7 +479,7 @@ impl StacksMessageCodec for TransactionSpendingCondition {
 
     fn consensus_deserialize<R: Read>(
         fd: &mut R,
-    ) -> Result<TransactionSpendingCondition, net_error> {
+    ) -> Result<TransactionSpendingCondition, codec_error> {
         // peek the hash mode byte
         let hash_mode_u8: u8 = read_next(fd)?;
         let peek_buf = [hash_mode_u8];
@@ -489,7 +493,7 @@ impl StacksMessageCodec for TransactionSpendingCondition {
                 TransactionSpendingCondition::Multisig(cond)
             } else {
                 test_debug!("Invalid address hash mode {}", hash_mode_u8);
-                return Err(net_error::DeserializeError(format!(
+                return Err(codec_error::DeserializeError(format!(
                     "Failed to parse spending condition: invalid hash mode {}",
                     hash_mode_u8
                 )));
@@ -514,7 +518,7 @@ impl TransactionSpendingCondition {
             SinglesigSpendingCondition {
                 signer: signer_addr.bytes.clone(),
                 nonce: 0,
-                fee_rate: 0,
+                tx_fee: 0,
                 hash_mode: SinglesigHashMode::P2PKH,
                 key_encoding: key_encoding,
                 signature: MessageSignature::empty(),
@@ -534,7 +538,7 @@ impl TransactionSpendingCondition {
             SinglesigSpendingCondition {
                 signer: signer_addr.bytes.clone(),
                 nonce: 0,
-                fee_rate: 0,
+                tx_fee: 0,
                 hash_mode: SinglesigHashMode::P2WPKH,
                 key_encoding: TransactionPublicKeyEncoding::Compressed,
                 signature: MessageSignature::empty(),
@@ -557,7 +561,7 @@ impl TransactionSpendingCondition {
             MultisigSpendingCondition {
                 signer: signer_addr.bytes.clone(),
                 nonce: 0,
-                fee_rate: 0,
+                tx_fee: 0,
                 hash_mode: MultisigHashMode::P2SH,
                 fields: vec![],
                 signatures_required: num_sigs,
@@ -580,7 +584,7 @@ impl TransactionSpendingCondition {
             MultisigSpendingCondition {
                 signer: signer_addr.bytes.clone(),
                 nonce: 0,
-                fee_rate: 0,
+                tx_fee: 0,
                 hash_mode: MultisigHashMode::P2WSH,
                 fields: vec![],
                 signatures_required: num_sigs,
@@ -595,7 +599,7 @@ impl TransactionSpendingCondition {
         TransactionSpendingCondition::Singlesig(SinglesigSpendingCondition {
             signer: Hash160([0u8; 20]),
             nonce: 0,
-            fee_rate: 0,
+            tx_fee: 0,
             hash_mode: SinglesigHashMode::P2PKH,
             key_encoding: TransactionPublicKeyEncoding::Compressed,
             signature: MessageSignature::empty(),
@@ -641,10 +645,10 @@ impl TransactionSpendingCondition {
         }
     }
 
-    pub fn fee_rate(&self) -> u64 {
+    pub fn tx_fee(&self) -> u64 {
         match *self {
-            TransactionSpendingCondition::Singlesig(ref data) => data.fee_rate,
-            TransactionSpendingCondition::Multisig(ref data) => data.fee_rate,
+            TransactionSpendingCondition::Singlesig(ref data) => data.tx_fee,
+            TransactionSpendingCondition::Multisig(ref data) => data.tx_fee,
         }
     }
 
@@ -659,21 +663,21 @@ impl TransactionSpendingCondition {
         }
     }
 
-    pub fn set_fee_rate(&mut self, fee_rate: u64) -> () {
+    pub fn set_tx_fee(&mut self, tx_fee: u64) -> () {
         match *self {
             TransactionSpendingCondition::Singlesig(ref mut singlesig_data) => {
-                singlesig_data.fee_rate = fee_rate;
+                singlesig_data.tx_fee = tx_fee;
             }
             TransactionSpendingCondition::Multisig(ref mut multisig_data) => {
-                multisig_data.fee_rate = fee_rate;
+                multisig_data.tx_fee = tx_fee;
             }
         }
     }
 
-    pub fn get_fee_rate(&self) -> u64 {
+    pub fn get_tx_fee(&self) -> u64 {
         match *self {
-            TransactionSpendingCondition::Singlesig(ref singlesig_data) => singlesig_data.fee_rate,
-            TransactionSpendingCondition::Multisig(ref multisig_data) => multisig_data.fee_rate,
+            TransactionSpendingCondition::Singlesig(ref singlesig_data) => singlesig_data.tx_fee,
+            TransactionSpendingCondition::Multisig(ref multisig_data) => multisig_data.tx_fee,
         }
     }
 
@@ -697,12 +701,12 @@ impl TransactionSpendingCondition {
     pub fn clear(&mut self) -> () {
         match *self {
             TransactionSpendingCondition::Singlesig(ref mut singlesig_data) => {
-                singlesig_data.fee_rate = 0;
+                singlesig_data.tx_fee = 0;
                 singlesig_data.nonce = 0;
                 singlesig_data.signature = MessageSignature::empty();
             }
             TransactionSpendingCondition::Multisig(ref mut multisig_data) => {
-                multisig_data.fee_rate = 0;
+                multisig_data.tx_fee = 0;
                 multisig_data.nonce = 0;
                 multisig_data.fields.clear();
             }
@@ -712,7 +716,7 @@ impl TransactionSpendingCondition {
     pub fn make_sighash_presign(
         cur_sighash: &Txid,
         cond_code: &TransactionAuthFlags,
-        fee_rate: u64,
+        tx_fee: u64,
         nonce: u64,
     ) -> Txid {
         // new hash combines the previous hash and all the new data this signature will add.  This
@@ -726,7 +730,7 @@ impl TransactionSpendingCondition {
 
         new_tx_hash_bits.extend_from_slice(cur_sighash.as_bytes());
         new_tx_hash_bits.extend_from_slice(&[*cond_code as u8]);
-        new_tx_hash_bits.extend_from_slice(&fee_rate.to_be_bytes());
+        new_tx_hash_bits.extend_from_slice(&tx_fee.to_be_bytes());
         new_tx_hash_bits.extend_from_slice(&nonce.to_be_bytes());
 
         assert!(new_tx_hash_bits.len() == new_tx_hash_bits_len as usize);
@@ -771,14 +775,14 @@ impl TransactionSpendingCondition {
     pub fn next_signature(
         cur_sighash: &Txid,
         cond_code: &TransactionAuthFlags,
-        fee_rate: u64,
+        tx_fee: u64,
         nonce: u64,
         privk: &StacksPrivateKey,
     ) -> Result<(MessageSignature, Txid), net_error> {
         let sighash_presign = TransactionSpendingCondition::make_sighash_presign(
             cur_sighash,
             cond_code,
-            fee_rate,
+            tx_fee,
             nonce,
         );
 
@@ -801,7 +805,7 @@ impl TransactionSpendingCondition {
     pub fn next_verification(
         cur_sighash: &Txid,
         cond_code: &TransactionAuthFlags,
-        fee_rate: u64,
+        tx_fee: u64,
         nonce: u64,
         key_encoding: &TransactionPublicKeyEncoding,
         sig: &MessageSignature,
@@ -809,7 +813,7 @@ impl TransactionSpendingCondition {
         let sighash_presign = TransactionSpendingCondition::make_sighash_presign(
             cur_sighash,
             cond_code,
-            fee_rate,
+            tx_fee,
             nonce,
         );
 
@@ -846,7 +850,7 @@ impl TransactionSpendingCondition {
 }
 
 impl StacksMessageCodec for TransactionAuth {
-    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), net_error> {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
         match *self {
             TransactionAuth::Standard(ref origin_condition) => {
                 write_next(fd, &(TransactionAuthFlags::AuthStandard as u8))?;
@@ -861,7 +865,7 @@ impl StacksMessageCodec for TransactionAuth {
         Ok(())
     }
 
-    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<TransactionAuth, net_error> {
+    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<TransactionAuth, codec_error> {
         let type_id: u8 = read_next(fd)?;
         let auth = match type_id {
             x if x == TransactionAuthFlags::AuthStandard as u8 => {
@@ -875,7 +879,7 @@ impl StacksMessageCodec for TransactionAuth {
             }
             _ => {
                 test_debug!("Unrecognized transaction auth flags {:?}", type_id);
-                return Err(net_error::DeserializeError(format!(
+                return Err(codec_error::DeserializeError(format!(
                     "Failed to parse transaction authorization: unrecognized auth flags {}",
                     type_id
                 )));
@@ -1028,17 +1032,17 @@ impl TransactionAuth {
         }
     }
 
-    pub fn set_fee_rate(&mut self, fee_rate: u64) -> () {
+    pub fn set_tx_fee(&mut self, tx_fee: u64) -> () {
         match *self {
-            TransactionAuth::Standard(ref mut s) => s.set_fee_rate(fee_rate),
-            TransactionAuth::Sponsored(_, ref mut s) => s.set_fee_rate(fee_rate),
+            TransactionAuth::Standard(ref mut s) => s.set_tx_fee(tx_fee),
+            TransactionAuth::Sponsored(_, ref mut s) => s.set_tx_fee(tx_fee),
         }
     }
 
-    pub fn get_fee_rate(&self) -> u64 {
+    pub fn get_tx_fee(&self) -> u64 {
         match *self {
-            TransactionAuth::Standard(ref s) => s.get_fee_rate(),
-            TransactionAuth::Sponsored(_, ref s) => s.get_fee_rate(),
+            TransactionAuth::Standard(ref s) => s.get_tx_fee(),
+            TransactionAuth::Sponsored(_, ref s) => s.get_tx_fee(),
         }
     }
 
@@ -1079,12 +1083,13 @@ impl TransactionAuth {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use chainstate::stacks::StacksPublicKey as PubKey;
     use chainstate::stacks::*;
     use net::codec::test::check_codec_and_corruption;
     use net::codec::*;
     use net::*;
+
+    use super::*;
 
     #[test]
     fn tx_stacks_spending_condition_p2pkh() {
@@ -1094,7 +1099,7 @@ mod test {
             hash_mode: SinglesigHashMode::P2PKH,
             key_encoding: TransactionPublicKeyEncoding::Uncompressed,
             nonce: 123,
-            fee_rate: 456,
+            tx_fee: 456,
             signature: MessageSignature::from_raw(&vec![0xff; 65]),
         };
 
@@ -1215,7 +1220,7 @@ mod test {
             hash_mode: SinglesigHashMode::P2PKH,
             key_encoding: TransactionPublicKeyEncoding::Compressed,
             nonce: 345,
-            fee_rate: 456,
+            tx_fee: 456,
             signature: MessageSignature::from_raw(&vec![0xfe; 65]),
         };
 
@@ -1355,7 +1360,7 @@ mod test {
             signer: Hash160([0x11; 20]),
             hash_mode: MultisigHashMode::P2SH,
             nonce: 123,
-            fee_rate: 456,
+            tx_fee: 456,
             fields: vec![
                 TransactionAuthField::Signature(TransactionPublicKeyEncoding::Uncompressed, MessageSignature::from_raw(&vec![0xff; 65])),
                 TransactionAuthField::Signature(TransactionPublicKeyEncoding::Uncompressed, MessageSignature::from_raw(&vec![0xfe; 65])),
@@ -1592,7 +1597,7 @@ mod test {
             signer: Hash160([0x11; 20]),
             hash_mode: MultisigHashMode::P2SH,
             nonce: 456,
-            fee_rate: 567,
+            tx_fee: 567,
             fields: vec![
                 TransactionAuthField::Signature(
                     TransactionPublicKeyEncoding::Compressed,
@@ -1860,7 +1865,7 @@ mod test {
             hash_mode: SinglesigHashMode::P2WPKH,
             key_encoding: TransactionPublicKeyEncoding::Compressed,
             nonce: 345,
-            fee_rate: 567,
+            tx_fee: 567,
             signature: MessageSignature::from_raw(&vec![0xfe; 65]),
         };
 
@@ -1993,7 +1998,7 @@ mod test {
             signer: Hash160([0x11; 20]),
             hash_mode: MultisigHashMode::P2WSH,
             nonce: 456,
-            fee_rate: 567,
+            tx_fee: 567,
             fields: vec![
                 TransactionAuthField::Signature(
                     TransactionPublicKeyEncoding::Compressed,
@@ -2257,7 +2262,7 @@ mod test {
                 hash_mode: SinglesigHashMode::P2PKH,
                 key_encoding: TransactionPublicKeyEncoding::Uncompressed,
                 nonce: 123,
-                fee_rate: 567,
+                tx_fee: 567,
                 signature: MessageSignature::from_raw(&vec![0xff; 65])
             }),
             TransactionSpendingCondition::Singlesig(SinglesigSpendingCondition {
@@ -2265,14 +2270,14 @@ mod test {
                 hash_mode: SinglesigHashMode::P2PKH,
                 key_encoding: TransactionPublicKeyEncoding::Compressed,
                 nonce: 345,
-                fee_rate: 567,
+                tx_fee: 567,
                 signature: MessageSignature::from_raw(&vec![0xff; 65])
             }),
             TransactionSpendingCondition::Multisig(MultisigSpendingCondition {
                 signer: Hash160([0x11; 20]),
                 hash_mode: MultisigHashMode::P2SH,
                 nonce: 123,
-                fee_rate: 567,
+                tx_fee: 567,
                 fields: vec![
                     TransactionAuthField::Signature(TransactionPublicKeyEncoding::Uncompressed, MessageSignature::from_raw(&vec![0xff; 65])),
                     TransactionAuthField::Signature(TransactionPublicKeyEncoding::Uncompressed, MessageSignature::from_raw(&vec![0xfe; 65])),
@@ -2284,7 +2289,7 @@ mod test {
                 signer: Hash160([0x11; 20]),
                 hash_mode: MultisigHashMode::P2SH,
                 nonce: 456,
-                fee_rate: 567,
+                tx_fee: 567,
                 fields: vec![
                     TransactionAuthField::Signature(TransactionPublicKeyEncoding::Compressed, MessageSignature::from_raw(&vec![0xff; 65])),
                     TransactionAuthField::Signature(TransactionPublicKeyEncoding::Compressed, MessageSignature::from_raw(&vec![0xfe; 65])),
@@ -2297,14 +2302,14 @@ mod test {
                 hash_mode: SinglesigHashMode::P2WPKH,
                 key_encoding: TransactionPublicKeyEncoding::Compressed,
                 nonce: 345,
-                fee_rate: 567,
+                tx_fee: 567,
                 signature: MessageSignature::from_raw(&vec![0xfe; 65]),
             }),
             TransactionSpendingCondition::Multisig(MultisigSpendingCondition {
                 signer: Hash160([0x11; 20]),
                 hash_mode: MultisigHashMode::P2WSH,
                 nonce: 456,
-                fee_rate: 567,
+                tx_fee: 567,
                 fields: vec![
                     TransactionAuthField::Signature(TransactionPublicKeyEncoding::Compressed, MessageSignature::from_raw(&vec![0xff; 65])),
                     TransactionAuthField::Signature(TransactionPublicKeyEncoding::Compressed, MessageSignature::from_raw(&vec![0xfe; 65])),
@@ -3150,7 +3155,7 @@ mod test {
                 signer: Hash160([0x11; 20]),
                 hash_mode: SinglesigHashMode::P2WPKH,
                 nonce: 123,
-                fee_rate: 567,
+                tx_fee: 567,
                 key_encoding: TransactionPublicKeyEncoding::Uncompressed,
                 signature: MessageSignature::from_raw(&vec![0xff; 65]),
             });
@@ -3272,7 +3277,7 @@ mod test {
             signer: Hash160([0x11; 20]),
             hash_mode: MultisigHashMode::P2WSH,
             nonce: 456,
-            fee_rate: 567,
+            tx_fee: 567,
             fields: vec![
                 TransactionAuthField::Signature(TransactionPublicKeyEncoding::Uncompressed, MessageSignature::from_raw(&vec![0xff; 65])),
                 TransactionAuthField::Signature(TransactionPublicKeyEncoding::Uncompressed, MessageSignature::from_raw(&vec![0xfe; 65])),
@@ -3581,7 +3586,7 @@ mod test {
             TransactionAuthFlags::AuthSponsored,
         ];
 
-        let fee_rates = vec![123, 456, 123, 456];
+        let tx_fees = vec![123, 456, 123, 456];
 
         let nonces: Vec<u64> = vec![1, 2, 3, 4];
 
@@ -3589,7 +3594,7 @@ mod test {
             let (sig, next_sighash) = TransactionSpendingCondition::next_signature(
                 &cur_sighash,
                 &auth_flags[i],
-                fee_rates[i],
+                tx_fees[i],
                 nonces[i],
                 &keys[i],
             )
@@ -3600,7 +3605,7 @@ mod test {
             expected_sighash_bytes.clear();
             expected_sighash_bytes.extend_from_slice(cur_sighash.as_bytes());
             expected_sighash_bytes.extend_from_slice(&[auth_flags[i] as u8]);
-            expected_sighash_bytes.extend_from_slice(&fee_rates[i].to_be_bytes());
+            expected_sighash_bytes.extend_from_slice(&tx_fees[i].to_be_bytes());
             expected_sighash_bytes.extend_from_slice(&nonces[i].to_be_bytes());
             let expected_sighash_presign = Txid::from_sighash_bytes(&expected_sighash_bytes[..]);
 
@@ -3622,7 +3627,7 @@ mod test {
                 TransactionSpendingCondition::next_verification(
                     &cur_sighash,
                     &auth_flags[i],
-                    fee_rates[i],
+                    tx_fees[i],
                     nonces[i],
                     &key_encoding,
                     &sig,

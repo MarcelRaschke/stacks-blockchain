@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -27,7 +27,7 @@ pub fn is_big_endian() -> bool {
 macro_rules! define_named_enum {
     ($Name:ident { $($Variant:ident($VarName:literal),)* }) =>
     {
-        #[derive(Debug)]
+        #[derive(::serde::Serialize, ::serde::Deserialize, Debug, Hash, PartialEq, Eq, Copy, Clone)]
         pub enum $Name {
             $($Variant),*,
         }
@@ -50,6 +50,19 @@ macro_rules! define_named_enum {
                         $Name::$Variant => $VarName.to_string(),
                     )*
                 }
+            }
+
+            pub fn get_name_str(&self) -> &'static str {
+                match self {
+                    $(
+                        $Name::$Variant => $VarName,
+                    )*
+                }
+            }
+        }
+        impl ::std::fmt::Display for $Name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                write!(f, "{}", self.get_name_str())
             }
         }
     }

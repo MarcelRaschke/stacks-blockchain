@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -45,14 +45,14 @@ use vm::analysis::run_analysis;
 use vm::ast::build_ast;
 use vm::types::{AssetIdentifier, Value};
 
-use vm::clarity::ClarityConnection;
-
 pub use vm::analysis::errors::CheckErrors;
 use vm::errors::Error as clarity_vm_error;
 
 use vm::database::ClarityDatabase;
 
 use vm::contracts::Contract;
+
+use clarity_vm::clarity::ClarityConnection;
 
 impl StacksChainState {
     pub fn get_contract<T: ClarityConnection>(
@@ -75,7 +75,7 @@ impl StacksChainState {
     ) -> Result<Option<Value>, Error> {
         clarity_tx
             .with_clarity_db_readonly(|ref mut db| {
-                match db.lookup_variable(contract_id, data_var) {
+                match db.lookup_variable_unknown_descriptor(contract_id, data_var) {
                     Ok(c) => Ok(Some(c)),
                     Err(clarity_vm_error::Unchecked(CheckErrors::NoSuchDataVariable(_))) => {
                         Ok(None)

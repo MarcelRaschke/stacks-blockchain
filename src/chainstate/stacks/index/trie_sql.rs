@@ -17,53 +17,45 @@
  along with Blockstack. If not, see <http://www.gnu.org/licenses/>.
 */
 
-use std::error;
-use std::fmt;
-use std::io;
-use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
-
 use std::char::from_digit;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::convert::{TryFrom, TryInto};
+use std::error;
+use std::fmt;
+use std::fs;
+use std::io;
+use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::iter::FromIterator;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-
-use std::fs;
+use std::os;
 use std::path::{Path, PathBuf};
 
-use std::iter::FromIterator;
-use std::os;
-
 use regex::Regex;
-
-use chainstate::burn::BlockHeaderHash;
-use chainstate::burn::BLOCK_HEADER_HASH_ENCODED_SIZE;
-
-use chainstate::stacks::index::{trie_sql, BlockMap, MarfTrieId, TrieHash, TRIEHASH_ENCODED_SIZE};
-
-use chainstate::stacks::index::storage::{TrieFileStorage, TrieStorageConnection};
-
-use chainstate::stacks::index::bits::{
-    get_node_byte_len, get_node_hash, read_block_identifier, read_hash_bytes,
-    read_node_hash_bytes as bits_read_node_hash_bytes, read_nodetype, write_nodetype_bytes,
-};
-
-use chainstate::stacks::index::node::{
-    clear_backptr, is_backptr, set_backptr, TrieLeaf, TrieNode, TrieNode16, TrieNode256, TrieNode4,
-    TrieNode48, TrieNodeID, TrieNodeType, TriePath, TriePtr,
-};
-
 use rusqlite::{
     blob::Blob,
     types::{FromSql, ToSql},
     Connection, Error as SqliteError, OptionalExtension, Transaction, NO_PARAMS,
 };
 
-use std::convert::{TryFrom, TryInto};
-
+use chainstate::stacks::index::bits::{
+    get_node_byte_len, get_node_hash, read_block_identifier, read_hash_bytes,
+    read_node_hash_bytes as bits_read_node_hash_bytes, read_nodetype, write_nodetype_bytes,
+};
+use chainstate::stacks::index::node::{
+    clear_backptr, is_backptr, set_backptr, TrieNode, TrieNode16, TrieNode256, TrieNode4,
+    TrieNode48, TrieNodeID, TrieNodeType, TriePath, TriePtr,
+};
+use chainstate::stacks::index::storage::{TrieFileStorage, TrieStorageConnection};
 use chainstate::stacks::index::Error;
-
+use chainstate::stacks::index::{trie_sql, BlockMap, MarfTrieId};
+use util::db::sql_pragma;
 use util::db::tx_begin_immediate;
 use util::log;
+
+use crate::types::chainstate::BlockHeaderHash;
+use crate::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE;
+use crate::types::proof::{TrieHash, TrieLeaf, TRIEHASH_ENCODED_SIZE};
 
 static SQL_MARF_DATA_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS marf_data (
@@ -91,6 +83,8 @@ CREATE TABLE IF NOT EXISTS block_extension_locks (block_hash TEXT PRIMARY KEY);
 ";
 
 pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
+    sql_pragma(conn, "PRAGMA journal_mode = WAL;")?;
+
     let tx = tx_begin_immediate(conn)?;
 
     tx.execute_batch(SQL_MARF_DATA_TABLE)?;
@@ -103,6 +97,15 @@ pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
 pub fn get_block_identifier<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result<u32, Error> {
     conn.query_row(
         "SELECT block_id FROM marf_data WHERE block_hash = ?",
+        &[bhh],
+        |row| row.get("block_id"),
+    )
+    .map_err(|e| e.into())
+}
+
+pub fn get_mined_block_identifier<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result<u32, Error> {
+    conn.query_row(
+        "SELECT block_id FROM mined_blocks WHERE block_hash = ?",
         &[bhh],
         |row| row.get("block_id"),
     )
@@ -161,6 +164,8 @@ pub fn write_trie_blob<T: MarfTrieId>(
         .insert(args)?
         .try_into()
         .expect("EXHAUSTION: MARF cannot track more than 2**31 - 1 blocks");
+
+    debug!("Wrote block trie {} to rowid {}", block_hash, block_id);
     Ok(block_id)
 }
 
@@ -169,13 +174,26 @@ pub fn write_trie_blob_to_mined<T: MarfTrieId>(
     block_hash: &T,
     data: &[u8],
 ) -> Result<u32, Error> {
-    let args: &[&dyn ToSql] = &[block_hash, &data];
-    let mut s =
-        conn.prepare("INSERT OR REPLACE INTO mined_blocks (block_hash, data) VALUES (?, ?)")?;
-    let block_id = s
-        .insert(args)?
-        .try_into()
-        .expect("EXHAUSTION: MARF cannot track more than 2**31 - 1 blocks");
+    if let Ok(block_id) = get_mined_block_identifier(conn, block_hash) {
+        // already exists; update
+        let args: &[&dyn ToSql] = &[&data, &block_id];
+        let mut s = conn.prepare("UPDATE mined_blocks SET data = ? WHERE block_id = ?")?;
+        s.execute(args)
+            .expect("EXHAUSTION: MARF cannot track more than 2**31 - 1 blocks");
+    } else {
+        // doesn't exist yet; insert
+        let args: &[&dyn ToSql] = &[block_hash, &data];
+        let mut s = conn.prepare("INSERT INTO mined_blocks (block_hash, data) VALUES (?, ?)")?;
+        s.execute(args)
+            .expect("EXHAUSTION: MARF cannot track more than 2**31 - 1 blocks");
+    };
+
+    let block_id = get_mined_block_identifier(conn, block_hash)?;
+
+    debug!(
+        "Wrote mined block trie {} to rowid {}",
+        block_hash, block_id
+    );
     Ok(block_id)
 }
 
@@ -188,14 +206,28 @@ pub fn write_trie_blob_to_unconfirmed<T: MarfTrieId>(
         panic!("BUG: tried to overwrite confirmed MARF trie {}", block_hash);
     }
 
-    let args: &[&dyn ToSql] = &[block_hash, &data, &1];
-    let mut s = conn.prepare(
-        "INSERT OR REPLACE INTO marf_data (block_hash, data, unconfirmed) VALUES (?, ?, ?)",
-    )?;
-    let block_id = s
-        .insert(args)?
-        .try_into()
-        .expect("EXHAUSTION: MARF cannot track more than 2**31 - 1 blocks");
+    if let Ok(Some(block_id)) = get_unconfirmed_block_identifier(conn, block_hash) {
+        // already exists; update
+        let args: &[&dyn ToSql] = &[&data, &block_id];
+        let mut s = conn.prepare("UPDATE marf_data SET data = ? WHERE block_id = ?")?;
+        s.execute(args)
+            .expect("EXHAUSTION: MARF cannot track more than 2**31 - 1 blocks");
+    } else {
+        // doesn't exist yet; insert
+        let args: &[&dyn ToSql] = &[block_hash, &data, &1];
+        let mut s =
+            conn.prepare("INSERT INTO marf_data (block_hash, data, unconfirmed) VALUES (?, ?, ?)")?;
+        s.execute(args)
+            .expect("EXHAUSTION: MARF cannot track more than 2**31 - 1 blocks");
+    };
+
+    let block_id = get_unconfirmed_block_identifier(conn, block_hash)?
+        .expect(&format!("BUG: stored {} but got no block ID", block_hash));
+
+    debug!(
+        "Wrote unconfirmed block trie {} to rowid {}",
+        block_hash, block_id
+    );
     Ok(block_id)
 }
 
@@ -216,7 +248,7 @@ pub fn read_all_block_hashes_and_roots<T: MarfTrieId>(
 ) -> Result<Vec<(TrieHash, T)>, Error> {
     let mut s = conn.prepare("SELECT block_hash, data FROM marf_data WHERE unconfirmed = 0")?;
     let rows = s.query_and_then(NO_PARAMS, |row| {
-        let block_hash: T = row.get("block_hash");
+        let block_hash: T = row.get_unwrap("block_hash");
         let data = row
             .get_raw("data")
             .as_blob()
@@ -331,7 +363,7 @@ pub fn tx_lock_bhh_for_extension<T: MarfTrieId>(
             .query_row(
                 "SELECT 1 FROM marf_data WHERE block_hash = ? LIMIT 1",
                 &[bhh],
-                |_row| (),
+                |_row| Ok(()),
             )
             .optional()?
             .is_some();
@@ -344,7 +376,7 @@ pub fn tx_lock_bhh_for_extension<T: MarfTrieId>(
         .query_row(
             "SELECT 1 FROM block_extension_locks WHERE block_hash = ? LIMIT 1",
             &[bhh],
-            |_row| (),
+            |_row| Ok(()),
         )
         .optional()?
         .is_some();
@@ -386,10 +418,12 @@ pub fn drop_lock<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result<(), Error>
 }
 
 pub fn drop_unconfirmed_trie<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result<(), Error> {
+    debug!("Drop unconfirmed trie sqlite blob {}", bhh);
     conn.execute(
         "DELETE FROM marf_data WHERE block_hash = ? AND unconfirmed = 1",
         &[bhh],
     )?;
+    debug!("Dropped unconfirmed trie sqlite blob {}", bhh);
     Ok(())
 }
 

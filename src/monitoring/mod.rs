@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,47 +14,58 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::{fmt, fs, path::PathBuf};
+
+use rusqlite::{OpenFlags, OptionalExtension};
+
+use crate::{
+    burnchains::Txid,
+    core::MemPoolDB,
+    net::{Error as net_error, HttpRequestType},
+    util::{
+        db::{tx_busy_handler, DBConn},
+        get_epoch_time_secs,
+    },
+};
+use burnchains::BurnchainSigner;
+use std::error::Error;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use util::db::Error as DatabaseError;
+use util::uint::{Uint256, Uint512};
+
 #[cfg(feature = "monitoring_prom")]
 mod prometheus;
+
+#[cfg(feature = "monitoring_prom")]
+lazy_static! {
+    static ref GLOBAL_BURNCHAIN_SIGNER: Mutex<Option<BurnchainSigner>> = Mutex::new(None);
+}
 
 pub fn increment_rpc_calls_counter() {
     #[cfg(feature = "monitoring_prom")]
     prometheus::RPC_CALL_COUNTER.inc();
 }
 
-pub fn increment_p2p_msg_unauthenticated_handshake_received_counter() {
+pub fn instrument_http_request_handler<F, R>(
+    req: HttpRequestType,
+    handler: F,
+) -> Result<R, net_error>
+where
+    F: FnOnce(HttpRequestType) -> Result<R, net_error>,
+{
     #[cfg(feature = "monitoring_prom")]
-    prometheus::P2P_MSG_UNAUTHENTICATED_HANDSHAKE_RECEIVED_COUNTER.inc();
-}
+    increment_rpc_calls_counter();
 
-pub fn increment_p2p_msg_authenticated_handshake_received_counter() {
     #[cfg(feature = "monitoring_prom")]
-    prometheus::P2P_MSG_AUTHENTICATED_HANDSHAKE_RECEIVED_COUNTER.inc();
-}
+    let timer = prometheus::new_rpc_call_timer(req.get_path());
 
-pub fn increment_p2p_msg_get_neighbors_received_counter() {
-    #[cfg(feature = "monitoring_prom")]
-    prometheus::P2P_MSG_GET_NEIGHBORS_RECEIVED_COUNTER.inc();
-}
+    let res = handler(req);
 
-pub fn increment_p2p_msg_get_blocks_inv_received_counter() {
     #[cfg(feature = "monitoring_prom")]
-    prometheus::P2P_MSG_GET_BLOCKS_INV_RECEIVED_COUNTER.inc();
-}
+    timer.stop_and_record();
 
-pub fn increment_p2p_msg_nack_sent_counter() {
-    #[cfg(feature = "monitoring_prom")]
-    prometheus::P2P_MSG_NACK_SENT_COUNTER.inc();
-}
-
-pub fn increment_p2p_msg_ping_received_counter() {
-    #[cfg(feature = "monitoring_prom")]
-    prometheus::P2P_MSG_PING_RECEIVED_COUNTER.inc();
-}
-
-pub fn increment_p2p_msg_nat_punch_request_received_counter() {
-    #[cfg(feature = "monitoring_prom")]
-    prometheus::P2P_MSG_NAT_PUNCH_REQUEST_RECEIVED_COUNTER.inc();
+    res
 }
 
 pub fn increment_stx_blocks_received_counter() {
@@ -117,8 +128,292 @@ pub fn increment_errors_emitted_counter() {
     prometheus::ERRORS_EMITTED_COUNTER.inc();
 }
 
+fn txid_tracking_db(chainstate_root_path: &str) -> Result<DBConn, DatabaseError> {
+    let mut path = PathBuf::from(chainstate_root_path);
+
+    path.push("tx_tracking.sqlite");
+    let db_path = path.to_str().ok_or_else(|| DatabaseError::ParseError)?;
+
+    let mut create_flag = false;
+    let open_flags = if fs::metadata(&db_path).is_err() {
+        // need to create
+        create_flag = true;
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+    } else {
+        // can just open
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+    };
+
+    let conn = DBConn::open_with_flags(&db_path, open_flags)?;
+
+    conn.busy_handler(Some(tx_busy_handler))?;
+
+    if create_flag {
+        conn.execute(
+            "CREATE TABLE processed_txids (txid TEXT NOT NULL PRIMARY KEY)",
+            rusqlite::NO_PARAMS,
+        )?;
+    }
+
+    Ok(conn)
+}
+
+fn txid_tracking_db_contains(conn: &DBConn, txid: &Txid) -> Result<bool, DatabaseError> {
+    let contains = conn
+        .query_row(
+            "SELECT 1 FROM processed_txids WHERE txid = ?",
+            &[txid],
+            |_row| Ok(true),
+        )
+        .optional()?
+        .is_some();
+    Ok(contains)
+}
+
+#[allow(unused_variables)]
+pub fn mempool_accepted(txid: &Txid, chainstate_root_path: &str) -> Result<(), DatabaseError> {
+    #[cfg(feature = "monitoring_prom")]
+    {
+        let tracking_db = txid_tracking_db(chainstate_root_path)?;
+
+        if txid_tracking_db_contains(&tracking_db, txid)? {
+            // processed by a previous block, do not track again
+            return Ok(());
+        }
+
+        prometheus::MEMPOOL_OUTSTANDING_TXS.inc();
+    }
+
+    Ok(())
+}
+
+#[allow(unused_variables)]
+pub fn log_transaction_processed(
+    txid: &Txid,
+    chainstate_root_path: &str,
+) -> Result<(), DatabaseError> {
+    #[cfg(feature = "monitoring_prom")]
+    {
+        let mempool_db_path = MemPoolDB::db_path(chainstate_root_path)?;
+        let mempool_conn =
+            DBConn::open_with_flags(&mempool_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let tracking_db = txid_tracking_db(chainstate_root_path)?;
+
+        let tx = match MemPoolDB::get_tx(&mempool_conn, txid)? {
+            Some(tx) => tx,
+            None => {
+                debug!("Could not log transaction receive to process time, txid not found in mempool"; "txid" => %txid);
+                return Ok(());
+            }
+        };
+
+        if txid_tracking_db_contains(&tracking_db, txid)? {
+            // processed by a previous block, do not track again
+            return Ok(());
+        }
+
+        let mempool_accept_time = tx.metadata.accept_time;
+        let time_now = get_epoch_time_secs();
+
+        let time_to_process = time_now - mempool_accept_time;
+
+        prometheus::MEMPOOL_OUTSTANDING_TXS.dec();
+        prometheus::MEMPOOL_TX_CONFIRM_TIME.observe(time_to_process as f64);
+    }
+    Ok(())
+}
+
 #[allow(unused_variables)]
 pub fn update_active_miners_count_gauge(value: i64) {
     #[cfg(feature = "monitoring_prom")]
     prometheus::ACTIVE_MINERS_COUNT_GAUGE.set(value);
 }
+
+#[allow(unused_variables)]
+pub fn update_stacks_tip_height(value: i64) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::STACKS_TIP_HEIGHT_GAUGE.set(value);
+}
+
+#[allow(unused_variables)]
+pub fn update_burnchain_height(value: i64) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::BURNCHAIN_HEIGHT_GAUGE.set(value);
+}
+
+#[allow(unused_variables)]
+pub fn update_inbound_neighbors(value: i64) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::INBOUND_NEIGHBORS_GAUGE.set(value);
+}
+
+#[allow(unused_variables)]
+pub fn update_outbound_neighbors(value: i64) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::OUTBOUND_NEIGHBORS_GAUGE.set(value);
+}
+
+#[allow(unused_variables)]
+pub fn update_inbound_bandwidth(value: i64) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::INBOUND_BANDWIDTH_GAUGE.add(value);
+}
+
+#[allow(unused_variables)]
+pub fn update_outbound_bandwidth(value: i64) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::OUTBOUND_BANDWIDTH_GAUGE.add(value);
+}
+
+#[allow(unused_variables)]
+pub fn update_inbound_rpc_bandwidth(value: i64) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::INBOUND_RPC_BANDWIDTH_GAUGE.add(value);
+}
+
+#[allow(unused_variables)]
+pub fn update_outbound_rpc_bandwidth(value: i64) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::OUTBOUND_RPC_BANDWIDTH_GAUGE.add(value);
+}
+
+#[allow(unused_variables)]
+pub fn increment_msg_counter(name: String) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::MSG_COUNTER_VEC
+        .with_label_values(&[&name])
+        .inc();
+}
+
+pub fn increment_stx_mempool_gc() {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::STX_MEMPOOL_GC.inc();
+}
+
+pub fn increment_contract_calls_processed() {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::CONTRACT_CALLS_PROCESSED_COUNT.inc();
+}
+
+/// Given a value (type uint256), return value/uint256::max() as an f64 value.
+/// The precision of the percentage is determined by the input `precision_points`, which is capped
+/// at a max of 15.
+fn convert_uint256_to_f64_percentage(value: Uint256, precision_points: u32) -> f64 {
+    let precision_points = precision_points.min(15);
+    let base = 10;
+    let multiplier = Uint512::from_u128(100 * u128::pow(base, precision_points));
+    let intermediate_result = ((Uint512::from_uint256(&value) * multiplier)
+        / Uint512::from_uint256(&Uint256::max()))
+    .low_u64() as i64;
+    let divisor = i64::pow(base as i64, precision_points);
+
+    let result = intermediate_result as f64 / divisor as f64;
+    result
+}
+
+#[cfg(test)]
+macro_rules! assert_approx_eq {
+    ($a: expr, $b: expr) => {{
+        let (a, b) = (&$a, &$b);
+        assert!(
+            (*a - *b).abs() < 1.0e-6,
+            "{} is not approximately equal to {}",
+            *a,
+            *b
+        );
+    }};
+}
+
+#[test]
+pub fn test_convert_uint256_to_f64() {
+    let original = ((Uint512::from_uint256(&Uint256::max()) * Uint512::from_u64(10))
+        / Uint512::from_u64(100))
+    .to_uint256();
+    assert_approx_eq!(convert_uint256_to_f64_percentage(original, 7), 10 as f64);
+
+    let original = ((Uint512::from_uint256(&Uint256::max()) * Uint512::from_u64(122))
+        / Uint512::from_u64(1000))
+    .to_uint256();
+    assert_approx_eq!(convert_uint256_to_f64_percentage(original, 7), 12.2);
+
+    let original = ((Uint512::from_uint256(&Uint256::max()) * Uint512::from_u64(122345))
+        / Uint512::from_u64(1000000))
+    .to_uint256();
+    assert_approx_eq!(convert_uint256_to_f64_percentage(original, 7), 12.2345);
+
+    let original = ((Uint512::from_uint256(&Uint256::max()) * Uint512::from_u64(12234567))
+        / Uint512::from_u64(100000000))
+    .to_uint256();
+    assert_approx_eq!(convert_uint256_to_f64_percentage(original, 7), 12.234567);
+
+    let original = ((Uint512::from_uint256(&Uint256::max()) * Uint512::from_u64(12234567))
+        / Uint512::from_u64(100000000))
+    .to_uint256();
+    assert_approx_eq!(convert_uint256_to_f64_percentage(original, 1000), 12.234567);
+}
+
+#[allow(unused_variables)]
+pub fn update_computed_relative_miner_score(value: Uint256) {
+    #[cfg(feature = "monitoring_prom")]
+    {
+        let percentage = convert_uint256_to_f64_percentage(value, 7);
+        prometheus::COMPUTED_RELATIVE_MINER_SCORE.set(percentage);
+    }
+}
+
+#[allow(unused_variables)]
+pub fn update_computed_miner_commitment(value: u128) {
+    #[cfg(feature = "monitoring_prom")]
+    {
+        let high_bits = (value >> 64) as u64;
+        let low_bits = value as u64;
+        prometheus::COMPUTED_MINER_COMMITMENT_HIGH.set(high_bits as i64);
+        prometheus::COMPUTED_MINER_COMMITMENT_LOW.set(low_bits as i64);
+    }
+}
+
+#[allow(unused_variables)]
+pub fn update_miner_current_median_commitment(value: u128) {
+    #[cfg(feature = "monitoring_prom")]
+    {
+        let high_bits = (value >> 64) as u64;
+        let low_bits = value as u64;
+        prometheus::MINER_CURRENT_MEDIAN_COMMITMENT_HIGH.set(high_bits as i64);
+        prometheus::MINER_CURRENT_MEDIAN_COMMITMENT_LOW.set(low_bits as i64);
+    }
+}
+
+/// Function sets the global variable `GLOBAL_BURNCHAIN_SIGNER`.
+/// Fails if there are multiple attempts to set this variable.
+#[allow(unused_variables)]
+pub fn set_burnchain_signer(signer: BurnchainSigner) -> Result<(), SetGlobalBurnchainSignerError> {
+    #[cfg(feature = "monitoring_prom")]
+    {
+        let mut signer_mutex = GLOBAL_BURNCHAIN_SIGNER.lock().unwrap();
+        if signer_mutex.is_some() {
+            return Err(SetGlobalBurnchainSignerError);
+        }
+
+        *signer_mutex = Some(signer);
+    }
+    Ok(())
+}
+
+pub fn get_burnchain_signer() -> Option<BurnchainSigner> {
+    #[cfg(feature = "monitoring_prom")]
+    {
+        return GLOBAL_BURNCHAIN_SIGNER.lock().unwrap().clone();
+    }
+    None
+}
+
+#[derive(Debug)]
+pub struct SetGlobalBurnchainSignerError;
+
+impl fmt::Display for SetGlobalBurnchainSignerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("A global default burnchain signer has already been set.")
+    }
+}
+
+impl Error for SetGlobalBurnchainSignerError {}

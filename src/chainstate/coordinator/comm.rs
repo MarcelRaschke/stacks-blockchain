@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -16,7 +16,7 @@
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Condvar, Mutex, RwLock,
+    Arc, Condvar, LockResult, Mutex, MutexGuard, RwLock, TryLockResult,
 };
 use std::time::{Duration, Instant};
 use std::{process, thread};
@@ -145,6 +145,11 @@ impl CoordinatorChannels {
         bools.stop = true;
         self.signal_wakeup.notify_all();
         false
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        let bools = self.signal_bools.lock().unwrap();
+        bools.stop.clone()
     }
 
     pub fn get_stacks_blocks_processed(&self) -> u64 {

@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -62,6 +62,7 @@ pub enum ParseErrors {
     ColonSeparatorUnexpected,
     InvalidCharactersDetected,
     InvalidEscaping,
+    CostComputationFailed(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -92,7 +93,7 @@ impl ParseError {
 
     pub fn set_pre_expressions(&mut self, exprs: Vec<PreSymbolicExpression>) {
         self.diagnostic.spans = exprs.iter().map(|e| e.span.clone()).collect();
-        self.pre_expressions.replace(exprs.clone().to_vec());
+        self.pre_expressions.replace(exprs.to_vec());
     }
 }
 
@@ -134,6 +135,12 @@ impl From<CostErrors> for ParseError {
             CostErrors::MemoryBalanceExceeded(a, b) => {
                 ParseError::new(ParseErrors::MemoryBalanceExceeded(a, b))
             }
+            CostErrors::CostComputationFailed(s) => {
+                ParseError::new(ParseErrors::CostComputationFailed(s))
+            }
+            CostErrors::CostContractLoadFailure => ParseError::new(
+                ParseErrors::CostComputationFailed("Failed to load cost contract".into()),
+            ),
         }
     }
 }
@@ -230,6 +237,7 @@ impl DiagnosableError for ParseErrors {
             ),
             ParseErrors::InvalidCharactersDetected => format!("invalid characters detected"),
             ParseErrors::InvalidEscaping => format!("invalid escaping detected in string"),
+            ParseErrors::CostComputationFailed(s) => format!("Cost computation failed: {}", s),
         }
     }
 

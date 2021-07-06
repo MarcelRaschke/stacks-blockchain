@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -27,34 +27,46 @@ extern crate rusqlite;
 #[macro_use(o, slog_log, slog_trace, slog_debug, slog_info, slog_warn, slog_error)]
 extern crate slog;
 
-use blockstack_lib::burnchains::db::BurnchainBlockData;
-use blockstack_lib::*;
-
-use std::env;
-use std::fs;
 use std::io;
 use std::io::prelude::*;
 use std::process;
-
-use blockstack_lib::util::log;
-
-use blockstack_lib::burnchains::BurnchainHeaderHash;
-use blockstack_lib::chainstate::burn::BlockHeaderHash;
-use blockstack_lib::chainstate::burn::ConsensusHash;
-use blockstack_lib::chainstate::stacks::index::marf::MarfConnection;
-use blockstack_lib::chainstate::stacks::index::marf::MARF;
-use blockstack_lib::chainstate::stacks::StacksBlockHeader;
-use blockstack_lib::chainstate::stacks::*;
-use blockstack_lib::net::StacksMessageCodec;
-use blockstack_lib::util::hash::{hex_bytes, to_hex};
-use blockstack_lib::util::retry::LogReader;
-
-use blockstack_lib::burnchains::bitcoin::spv;
-use blockstack_lib::burnchains::bitcoin::BitcoinNetworkType;
+use std::{collections::HashMap, env};
+use std::{convert::TryFrom, fs};
 
 use rusqlite::types::ToSql;
 use rusqlite::Connection;
 use rusqlite::OpenFlags;
+
+use blockstack_lib::burnchains::bitcoin::spv;
+use blockstack_lib::burnchains::bitcoin::BitcoinNetworkType;
+use blockstack_lib::chainstate::burn::ConsensusHash;
+use blockstack_lib::chainstate::stacks::db::ChainStateBootData;
+use blockstack_lib::chainstate::stacks::index::marf::MarfConnection;
+use blockstack_lib::chainstate::stacks::index::marf::MARF;
+use blockstack_lib::chainstate::stacks::*;
+use blockstack_lib::codec::StacksMessageCodec;
+use blockstack_lib::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, PoxId};
+use blockstack_lib::types::chainstate::{StacksBlockHeader, StacksBlockId};
+use blockstack_lib::types::proof::ClarityMarfTrieId;
+use blockstack_lib::util::get_epoch_time_ms;
+use blockstack_lib::util::hash::{hex_bytes, to_hex};
+use blockstack_lib::util::log;
+use blockstack_lib::util::retry::LogReader;
+use blockstack_lib::*;
+use blockstack_lib::{
+    burnchains::{db::BurnchainBlockData, PoxConstants},
+    chainstate::{
+        burn::db::sortdb::SortitionDB,
+        stacks::db::{StacksChainState, StacksHeaderInfo},
+    },
+    core::MemPoolDB,
+    util::{hash::Hash160, vrf::VRFProof},
+    vm::costs::ExecutionCost,
+};
+use blockstack_lib::{
+    net::{db::LocalPeer, p2p::PeerNetwork, PeerAddress},
+    vm::representations::UrlString,
+};
 
 fn main() {
     let mut argv: Vec<String> = env::args().collect();
@@ -163,6 +175,9 @@ fn main() {
             })
             .unwrap();
 
+        println!("Verified: {:#?}", tx.verify());
+        println!("Address: {}", tx.auth.origin().address_mainnet());
+
         println!("{:#?}", &tx);
         process::exit(0);
     }
@@ -184,6 +199,299 @@ fn main() {
             .unwrap();
 
         println!("{:#?}", &block);
+        process::exit(0);
+    }
+
+    if argv[1] == "get-block-inventory" {
+        if argv.len() < 3 {
+            eprintln!(
+                "Usage: {} get-block-inventory <working-dir>
+
+Given a <working-dir>, obtain a 2100 header hash block inventory (with an empty header cache).
+",
+                argv[0]
+            );
+            process::exit(1);
+        }
+
+        let sort_db_path = format!("{}/mainnet/burnchain/sortition", &argv[2]);
+        let chain_state_path = format!("{}/mainnet/chainstate/", &argv[2]);
+
+        let sort_db = SortitionDB::open(&sort_db_path, false)
+            .expect(&format!("Failed to open {}", &sort_db_path));
+        let chain_id = core::CHAIN_ID_MAINNET;
+        let (chain_state, _) = StacksChainState::open(true, chain_id, &chain_state_path)
+            .expect("Failed to open stacks chain state");
+        let chain_tip = SortitionDB::get_canonical_burn_chain_tip(sort_db.conn())
+            .expect("Failed to get sortition chain tip");
+
+        let start = time::Instant::now();
+
+        let header_hashes = {
+            let ic = sort_db.index_conn();
+
+            ic.get_stacks_header_hashes(2100, &chain_tip.consensus_hash, &HashMap::new())
+                .unwrap()
+        };
+
+        println!(
+            "Fetched header hashes in {}",
+            start.elapsed().as_seconds_f32()
+        );
+        let start = time::Instant::now();
+
+        let block_inv = chain_state.get_blocks_inventory(&header_hashes).unwrap();
+        println!("Fetched block inv in {}", start.elapsed().as_seconds_f32());
+        println!("{:?}", &block_inv);
+
+        println!("Done!");
+        process::exit(0);
+    }
+
+    if argv[1] == "can-download-microblock" {
+        if argv.len() < 3 {
+            eprintln!(
+                "Usage: {} can-download-microblock <working-dir>
+
+Given a <working-dir>, obtain a 2100 header hash inventory (with an empty header cache), and then
+check if the associated microblocks can be downloaded 
+",
+                argv[0]
+            );
+            process::exit(1);
+        }
+
+        let sort_db_path = format!("{}/mainnet/burnchain/sortition", &argv[2]);
+        let chain_state_path = format!("{}/mainnet/chainstate/", &argv[2]);
+
+        let sort_db = SortitionDB::open(&sort_db_path, false)
+            .expect(&format!("Failed to open {}", &sort_db_path));
+        let chain_id = core::CHAIN_ID_MAINNET;
+        let (chain_state, _) = StacksChainState::open(true, chain_id, &chain_state_path)
+            .expect("Failed to open stacks chain state");
+        let chain_tip = SortitionDB::get_canonical_burn_chain_tip(sort_db.conn())
+            .expect("Failed to get sortition chain tip");
+
+        let start = time::Instant::now();
+        let local_peer = LocalPeer::new(
+            0,
+            0,
+            PeerAddress::from_ipv4(127, 0, 0, 1),
+            0,
+            None,
+            0,
+            UrlString::try_from("abc").unwrap(),
+        );
+
+        let header_hashes = {
+            let ic = sort_db.index_conn();
+
+            ic.get_stacks_header_hashes(2100, &chain_tip.consensus_hash, &HashMap::new())
+                .unwrap()
+        };
+
+        println!(
+            "Fetched header hashes in {}",
+            start.elapsed().as_seconds_f32()
+        );
+
+        let start = time::Instant::now();
+        let mut total_load_headers = 0;
+
+        for (consensus_hash, block_hash_opt) in header_hashes.iter() {
+            let block_hash = match block_hash_opt {
+                Some(b) => b,
+                None => continue,
+            };
+
+            let index_block_hash =
+                StacksBlockHeader::make_index_block_hash(&consensus_hash, &block_hash);
+            let start_load_header = get_epoch_time_ms();
+            let parent_header_opt = {
+                let child_block_info = match StacksChainState::load_staging_block_info(
+                    &chain_state.db(),
+                    &index_block_hash,
+                ) {
+                    Ok(Some(hdr)) => hdr,
+                    _ => {
+                        debug!("No such block: {:?}", &index_block_hash);
+                        continue;
+                    }
+                };
+
+                match StacksChainState::load_block_header(
+                    &chain_state.blocks_path,
+                    &child_block_info.parent_consensus_hash,
+                    &child_block_info.parent_anchored_block_hash,
+                ) {
+                    Ok(header_opt) => {
+                        header_opt.map(|hdr| (hdr, child_block_info.parent_consensus_hash))
+                    }
+                    Err(_) => {
+                        // we don't know about this parent block yet
+                        debug!("{:?}: Do not have parent of anchored block {}/{} yet, so cannot ask for the microblocks it produced", &local_peer, &consensus_hash, &block_hash);
+                        continue;
+                    }
+                }
+            };
+
+            let end_load_header = get_epoch_time_ms();
+            total_load_headers += end_load_header.saturating_sub(start_load_header);
+
+            if let Some((parent_header, parent_consensus_hash)) = parent_header_opt {
+                PeerNetwork::can_download_microblock_stream(
+                    &local_peer,
+                    &chain_state,
+                    &parent_consensus_hash,
+                    &parent_header.block_hash(),
+                    &consensus_hash,
+                    &block_hash,
+                )
+                .unwrap();
+            } else {
+                continue;
+            }
+        }
+
+        println!(
+            "Checked can_download in {} (headers load took {}ms)",
+            start.elapsed().as_seconds_f32(),
+            total_load_headers
+        );
+
+        println!("Done!");
+        process::exit(0);
+    }
+
+    if argv[1] == "evaluate-pox-anchor" {
+        if argv.len() < 4 {
+            eprintln!("Usage: {} evaluate-pox-anchor <path to mainnet/burnchain/sortition> <height> (last-height)", argv[0]);
+            process::exit(1);
+        }
+        let start_height: u64 = argv[3].parse().expect("Failed to parse <height> argument");
+        let end_height: u64 = argv
+            .get(4)
+            .map(|x| x.parse().expect("Failed to parse <end-height> argument"))
+            .unwrap_or(start_height);
+
+        let sort_db =
+            SortitionDB::open(&argv[2], false).expect(&format!("Failed to open {}", argv[2]));
+        let chain_tip = SortitionDB::get_canonical_sortition_tip(sort_db.conn())
+            .expect("Failed to get sortition chain tip");
+        let sort_conn = sort_db.index_handle(&chain_tip);
+
+        let mut results = vec![];
+
+        for eval_height in start_height..(1 + end_height) {
+            if (sort_conn.context.first_block_height + 100) >= eval_height {
+                eprintln!("Block height too low to evaluate");
+                process::exit(1);
+            }
+
+            let eval_tip = SortitionDB::get_ancestor_snapshot(&sort_conn, eval_height, &chain_tip)
+                .expect("Failed to get chain tip to evaluate at")
+                .expect("Failed to get chain tip to evaluate at");
+
+            let pox_consts = PoxConstants::mainnet_default();
+
+            let result = sort_conn
+                .get_chosen_pox_anchor_check_position(
+                    &eval_tip.burn_header_hash,
+                    &pox_consts,
+                    false,
+                )
+                .expect("Failed to compute PoX cycle");
+
+            match result {
+                Ok((_, _, confirmed_by)) => results.push((eval_height, true, confirmed_by)),
+                Err(confirmed_by) => results.push((eval_height, false, confirmed_by)),
+            };
+        }
+
+        println!("Block height, Would select anchor, Anchor agreement");
+        for r in results.iter() {
+            println!("{}, {}, {}", &r.0, &r.1, &r.2);
+        }
+
+        process::exit(0);
+    }
+
+    if argv[1] == "try-mine" {
+        if argv.len() < 3 {
+            eprintln!(
+                "Usage: {} try-mine <working-dir>
+
+Given a <working-dir>, try to ''mine'' an anchored block. This invokes the miner block
+assembly, but does not attempt to broadcast a block commit. This is useful for determining
+what transactions a given chain state would include in an anchor block, or otherwise
+simulating a miner.
+",
+                argv[0]
+            );
+            process::exit(1);
+        }
+
+        let sort_db_path = format!("{}/mainnet/burnchain/sortition", &argv[2]);
+        let chain_state_path = format!("{}/mainnet/chainstate/", &argv[2]);
+
+        let sort_db = SortitionDB::open(&sort_db_path, false)
+            .expect(&format!("Failed to open {}", &sort_db_path));
+        let chain_id = core::CHAIN_ID_MAINNET;
+        let (chain_state, _) = StacksChainState::open(true, chain_id, &chain_state_path)
+            .expect("Failed to open stacks chain state");
+        let chain_tip = SortitionDB::get_canonical_burn_chain_tip(sort_db.conn())
+            .expect("Failed to get sortition chain tip");
+
+        let mut mempool_db =
+            MemPoolDB::open(true, chain_id, &chain_state_path).expect("Failed to open mempool db");
+
+        let stacks_block = chain_state.get_stacks_chain_tip(&sort_db).unwrap().unwrap();
+        let parent_header = StacksChainState::get_anchored_block_header_info(
+            chain_state.db(),
+            &stacks_block.consensus_hash,
+            &stacks_block.anchored_block_hash,
+        )
+        .expect("Failed to load chain tip header info")
+        .expect("Failed to load chain tip header info");
+
+        let sk = StacksPrivateKey::new();
+        let mut tx_auth = TransactionAuth::from_p2pkh(&sk).unwrap();
+        tx_auth.set_origin_nonce(0);
+
+        let mut coinbase_tx = StacksTransaction::new(
+            TransactionVersion::Mainnet,
+            tx_auth,
+            TransactionPayload::Coinbase(CoinbasePayload([0u8; 32])),
+        );
+
+        coinbase_tx.chain_id = chain_id;
+        coinbase_tx.anchor_mode = TransactionAnchorMode::OnChainOnly;
+        let mut tx_signer = StacksTransactionSigner::new(&coinbase_tx);
+        tx_signer.sign_origin(&sk).unwrap();
+        let coinbase_tx = tx_signer.get_tx().unwrap();
+
+        let result = StacksBlockBuilder::build_anchored_block(
+            &chain_state,
+            &sort_db.index_conn(),
+            &mut mempool_db,
+            &parent_header,
+            chain_tip.total_burn,
+            VRFProof::empty(),
+            Hash160([0; 20]),
+            &coinbase_tx,
+            core::BLOCK_LIMIT_MAINNET.clone(),
+            None,
+        );
+
+        println!(
+            "{} mined block @ height = {}",
+            if result.is_ok() {
+                "Successfully"
+            } else {
+                "Failed to"
+            },
+            parent_header.block_height + 1
+        );
         process::exit(0);
     }
 
@@ -228,8 +536,8 @@ fn main() {
         let (marf_path, db_path, arg_next) = if argv.len() == 5 {
             let headers_dir = &argv[2];
             (
-                format!("{}/vm/index", &headers_dir),
-                format!("{}/vm/headers.db", &headers_dir),
+                format!("{}/vm/index.sqlite", &headers_dir),
+                format!("{}/vm/headers.sqlite", &headers_dir),
                 3,
             )
         } else {
@@ -260,7 +568,7 @@ fn main() {
                 "SELECT value FROM __fork_storage WHERE value_hash = ?1",
                 args,
                 |row| {
-                    let s: String = row.get(0);
+                    let s: String = row.get_unwrap(0);
                     Ok(s)
                 },
             );
@@ -321,7 +629,7 @@ fn main() {
             println!("{}, {}", cur_burn, cur_tip);
             let (next_burn, next_tip) = match
                 conn.query_row("SELECT parent_burn_header_hash, parent_anchored_block_hash FROM staging_blocks WHERE anchored_block_hash = ? and burn_header_hash = ?",
-                               &[&cur_tip as &dyn rusqlite::types::ToSql, &cur_burn], |row| (row.get(0), row.get(1))) {
+                               &[&cur_tip as &dyn rusqlite::types::ToSql, &cur_burn], |row| Ok((row.get_unwrap(0), row.get_unwrap(1)))) {
                     Ok(x) => x,
                     Err(e) => {
                         match e {
@@ -373,17 +681,17 @@ fn main() {
     }
 
     if argv[1] == "replay-chainstate" {
+        use blockstack_lib::types::chainstate::StacksAddress;
+        use blockstack_lib::types::chainstate::StacksBlockHeader;
         use burnchains::bitcoin::indexer::BitcoinIndexer;
         use burnchains::db::BurnchainDB;
         use burnchains::Address;
         use burnchains::Burnchain;
-        use chainstate::burn::db::sortdb::{PoxId, SortitionDB};
+        use chainstate::burn::db::sortdb::SortitionDB;
         use chainstate::burn::BlockSnapshot;
         use chainstate::stacks::db::blocks::StagingBlock;
         use chainstate::stacks::db::StacksChainState;
         use chainstate::stacks::index::MarfTrieId;
-        use chainstate::stacks::StacksAddress;
-        use chainstate::stacks::StacksBlockHeader;
         use core::*;
         use net::relay::Relayer;
         use std::collections::HashMap;
@@ -408,8 +716,8 @@ fn main() {
             StacksChainState::open(false, 0x80000000, old_chainstate_path).unwrap();
         let old_sortition_db = SortitionDB::open(old_sort_path, true).unwrap();
 
-        // initial argon balances -- see testnet/stacks-node/conf/argon-follower-conf.toml
-        let initial_argon_balances = vec![
+        // initial argon balances -- see testnet/stacks-node/conf/testnet-follower-conf.toml
+        let initial_balances = vec![
             (
                 StacksAddress::from_string("STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6")
                     .unwrap()
@@ -444,33 +752,46 @@ fn main() {
             read_count: 5_0_000,
             runtime: 1_00_000_000,
         };
-
-        let burnchain = Burnchain::new(&burnchain_db_path, "bitcoin", "regtest").unwrap();
+        let burnchain = Burnchain::regtest(&burnchain_db_path);
+        let first_burnchain_block_height = burnchain.first_block_height;
+        let first_burnchain_block_hash = burnchain.first_block_hash;
         let indexer: BitcoinIndexer = burnchain.make_indexer().unwrap();
         let (mut new_sortition_db, _) = burnchain.connect_db(&indexer, true).unwrap();
 
         let old_burnchaindb = BurnchainDB::connect(
             &old_burnchaindb_path,
-            burnchain.first_block_height,
-            &burnchain.first_block_hash,
-            FIRST_BURNCHAIN_BLOCK_TIMESTAMP,
+            first_burnchain_block_height,
+            &first_burnchain_block_hash,
+            BITCOIN_REGTEST_FIRST_BLOCK_TIMESTAMP.into(),
             true,
         )
         .unwrap();
+
+        let mut boot_data = ChainStateBootData {
+            initial_balances,
+            post_flight_callback: None,
+            first_burnchain_block_hash,
+            first_burnchain_block_height: first_burnchain_block_height as u32,
+            first_burnchain_block_timestamp: 0,
+            pox_constants: PoxConstants::regtest_default(),
+            get_bulk_initial_lockups: None,
+            get_bulk_initial_balances: None,
+            get_bulk_initial_namespaces: None,
+            get_bulk_initial_names: None,
+        };
 
         let (mut new_chainstate, _) = StacksChainState::open_and_exec(
             false,
             0x80000000,
             new_chainstate_path,
-            Some(initial_argon_balances),
-            |_| {},
+            Some(&mut boot_data),
             argon_block_limit,
         )
         .unwrap();
 
         let all_snapshots = old_sortition_db.get_all_snapshots().unwrap();
         let all_stacks_blocks =
-            StacksChainState::get_all_staging_block_headers(&old_chainstate.blocks_db).unwrap();
+            StacksChainState::get_all_staging_block_headers(&old_chainstate.db()).unwrap();
 
         // order block hashes by arrival index
         let mut stacks_blocks_arrival_indexes = vec![];
@@ -531,15 +852,8 @@ fn main() {
             loop {
                 // simulate the p2p refreshing itself
                 // update p2p's read-only view of the unconfirmed state
-                let (canonical_burn_tip, canonical_block_tip) =
-                    SortitionDB::get_canonical_stacks_chain_tip_hash(p2p_new_sortition_db.conn())
-                        .expect("Failed to read canonical stacks chain tip");
-                let canonical_tip = StacksBlockHeader::make_index_block_hash(
-                    &canonical_burn_tip,
-                    &canonical_block_tip,
-                );
                 p2p_chainstate
-                    .refresh_unconfirmed_state_readonly(canonical_tip)
+                    .refresh_unconfirmed_state(&p2p_new_sortition_db.index_conn())
                     .expect("Failed to open unconfirmed Clarity state");
 
                 sleep_ms(100);
@@ -559,7 +873,7 @@ fn main() {
                 continue;
             }
 
-            let (new_snapshot, _) = {
+            let (new_snapshot, ..) = {
                 let sortition_tip =
                     SortitionDB::get_canonical_burn_chain_tip(new_sortition_db.conn()).unwrap();
                 new_sortition_db
@@ -671,8 +985,6 @@ fn main() {
                     }
                 }
             }
-
-            Relayer::setup_unconfirmed_state(&mut new_chainstate, &mut new_sortition_db).unwrap();
         }
 
         eprintln!(
@@ -687,27 +999,4 @@ fn main() {
         eprintln!("Usage: {} blockchain network working_dir", argv[0]);
         process::exit(1);
     }
-
-    let blockchain = &argv[1];
-    let network = &argv[2];
-    let working_dir = &argv[3];
-
-    match (blockchain.as_str(), network.as_str()) {
-        ("bitcoin", "mainnet") | ("bitcoin", "testnet") | ("bitcoin", "regtest") => {
-            let block_height_res = core::sync_burnchain_bitcoin(&working_dir, &network);
-            match block_height_res {
-                Err(e) => {
-                    eprintln!("Failed to sync {} {}: {:?}", blockchain, network, e);
-                    process::exit(1);
-                }
-                Ok(height) => {
-                    println!("Synchronized state to block {}", height);
-                }
-            }
-        }
-        (_, _) => {
-            eprintln!("Unrecognized blockchain and/or network");
-            process::exit(1);
-        }
-    };
 }

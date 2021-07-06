@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -19,31 +19,26 @@ use std::error;
 use std::fmt;
 use std::io;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-
 use std::marker::PhantomData;
 
-use chainstate::burn::BlockHeaderHash;
-use chainstate::burn::BLOCK_HEADER_HASH_ENCODED_SIZE;
+use sha2::Digest;
 
 use chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash, get_nodetype_hash_bytes};
-
-use chainstate::stacks::index::node::{
-    clear_backptr, is_backptr, set_backptr, CursorError, TrieCursor, TrieLeaf, TrieNode,
-    TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeID, TrieNodeType, TriePtr,
-};
-
-use chainstate::stacks::index::storage::{TrieFileStorage, TrieStorageConnection};
-
 use chainstate::stacks::index::marf::MARF;
-
-use chainstate::stacks::index::{MarfTrieId, TrieHash, TrieHasher, TRIEHASH_ENCODED_SIZE};
-
+use chainstate::stacks::index::node::{
+    clear_backptr, is_backptr, set_backptr, CursorError, TrieCursor, TrieNode, TrieNode16,
+    TrieNode256, TrieNode4, TrieNode48, TrieNodeID, TrieNodeType, TriePtr,
+};
+use chainstate::stacks::index::storage::{TrieFileStorage, TrieStorageConnection};
 use chainstate::stacks::index::Error;
-
-use sha2::Digest;
+use chainstate::stacks::index::{MarfTrieId, TrieHasher};
 use util::hash::to_hex;
 use util::log;
 use util::macros::is_trace;
+
+use crate::types::chainstate::BlockHeaderHash;
+use crate::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE;
+use crate::types::proof::{TrieHash, TrieLeaf, TRIEHASH_ENCODED_SIZE};
 
 /// We don't actually instantiate a Trie, but we still need to pass a type parameter for the
 /// storage implementation.
@@ -334,7 +329,7 @@ impl Trie {
         // update cursor to point to this node4 as the last-node-visited, and set the newly-created
         // ptr as the last ptr traversed (so the cursor still points to this leaf, but accurately
         // reflects the path taken to it).
-        cursor.repair_retarget(&node4.clone(), &ret, &storage.get_cur_block());
+        cursor.repair_retarget(&node4, &ret, &storage.get_cur_block());
 
         trace!(
             "Promoted {:?} to {:?}, {:?}, {:?}, new ptr = {:?}",
@@ -441,8 +436,12 @@ impl Trie {
             TrieNodeType::Leaf(_) => panic!("Cannot insert into a leaf"),
             TrieNodeType::Node256(_) => panic!("Somehow could not insert into a Node256"),
             TrieNodeType::Node4(ref data) => TrieNodeType::Node16(TrieNode16::from_node4(data)),
-            TrieNodeType::Node16(ref data) => TrieNodeType::Node48(TrieNode48::from_node16(data)),
-            TrieNodeType::Node48(ref data) => TrieNodeType::Node256(TrieNode256::from_node48(data)),
+            TrieNodeType::Node16(ref data) => {
+                TrieNodeType::Node48(Box::new(TrieNode48::from_node16(data)))
+            }
+            TrieNodeType::Node48(ref data) => {
+                TrieNodeType::Node256(Box::new(TrieNode256::from_node48(data.as_ref())))
+            }
         };
 
         let node_ptr = cursor.ptr();
@@ -567,7 +566,7 @@ impl Trie {
             cur_node_cur_ptr.chr(),
             cur_node_cur_ptr.ptr(),
         );
-        cursor.repair_retarget(&new_node.clone(), &ret, &storage.get_cur_block());
+        cursor.repair_retarget(&new_node, &ret, &storage.get_cur_block());
 
         trace!("splice_leaf: node-X' at {:?}", &ret);
         Ok(ret)
@@ -896,17 +895,20 @@ impl Trie {
 mod test {
     #![allow(unused_variables)]
     #![allow(unused_assignments)]
-    use super::*;
-    use std::io::Cursor;
 
-    use chainstate::stacks::index::test::*;
+    use std::io::Cursor;
 
     use chainstate::stacks::index::bits::*;
     use chainstate::stacks::index::marf::*;
     use chainstate::stacks::index::node::*;
     use chainstate::stacks::index::proofs::*;
     use chainstate::stacks::index::storage::*;
+    use chainstate::stacks::index::test::*;
     use chainstate::stacks::index::trie::*;
+
+    use crate::types::proof::ClarityMarfTrieId;
+
+    use super::*;
 
     fn walk_to_insertion_point(
         f: &mut TrieStorageConnection<BlockHeaderHash>,

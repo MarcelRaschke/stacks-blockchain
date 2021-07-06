@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -15,6 +15,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 pub mod analysis_db;
+pub mod arithmetic_checker;
 pub mod contract_interface_builder;
 pub mod errors;
 pub mod read_only_checker;
@@ -31,14 +32,15 @@ use vm::types::{QualifiedContractIdentifier, TypeSignature};
 pub use self::analysis_db::AnalysisDatabase;
 pub use self::errors::{CheckError, CheckErrors, CheckResult};
 
+use self::arithmetic_checker::ArithmeticOnlyChecker;
 use self::contract_interface_builder::build_contract_interface;
 use self::read_only_checker::ReadOnlyChecker;
 use self::trait_checker::TraitChecker;
 use self::type_checker::TypeChecker;
 
 pub fn mem_type_check(snippet: &str) -> CheckResult<(Option<TypeSignature>, ContractAnalysis)> {
+    use crate::clarity_vm::database::MemoryBackingStore;
     use vm::ast::parse;
-    use vm::database::MemoryBackingStore;
     let contract_identifier = QualifiedContractIdentifier::transient();
     let mut contract = parse(&contract_identifier, snippet).unwrap();
     let mut marf = MemoryBackingStore::new();
@@ -74,7 +76,7 @@ pub fn type_check(
         expressions,
         analysis_db,
         insert_contract,
-        LimitedCostTracker::new_max_limit(),
+        LimitedCostTracker::new_free(),
     )
     .map_err(|(e, _cost_tracker)| e)
 }
@@ -95,6 +97,8 @@ pub fn run_analysis(
         ReadOnlyChecker::run_pass(&mut contract_analysis, db)?;
         TypeChecker::run_pass(&mut contract_analysis, db)?;
         TraitChecker::run_pass(&mut contract_analysis, db)?;
+        ArithmeticOnlyChecker::check_contract_cost_eligible(&mut contract_analysis);
+
         if STORE_CONTRACT_SRC_INTERFACE {
             let interface = build_contract_interface(&contract_analysis);
             contract_analysis.contract_interface = Some(interface);

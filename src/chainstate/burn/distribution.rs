@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,220 +14,323 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::collections::BTreeMap;
+use std::cmp;
+use std::collections::{BTreeMap, HashMap};
+use std::convert::TryInto;
 
-use chainstate::burn::operations::{
-    BlockstackOperation, BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp,
-    UserBurnSupportOp,
-};
-
+use address::AddressHashMode;
 use burnchains::Address;
 use burnchains::Burnchain;
 use burnchains::PublicKey;
 use burnchains::Txid;
 use burnchains::{BurnchainRecipient, BurnchainSigner, BurnchainTransaction};
-
-use address::AddressHashMode;
+use chainstate::burn::operations::{
+    leader_block_commit::MissedBlockCommit, BlockstackOperationType, LeaderBlockCommitOp,
+    LeaderKeyRegisterOp, UserBurnSupportOp,
+};
 use chainstate::stacks::StacksPublicKey;
-
+use core::MINING_COMMITMENT_WINDOW;
+use monitoring;
 use util::hash::Hash160;
+use util::log;
 use util::uint::BitArray;
 use util::uint::Uint256;
 use util::uint::Uint512;
-
-use util::log;
-
 use util::vrf::VRFPublicKey;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BurnSamplePoint {
     pub burns: u128,
     pub range_start: Uint256,
     pub range_end: Uint256,
     pub candidate: LeaderBlockCommitOp,
-    pub key: LeaderKeyRegisterOp,
     pub user_burns: Vec<UserBurnSupportOp>,
 }
 
+#[derive(Debug, Clone)]
+enum LinkedCommitIdentifier {
+    Missed(MissedBlockCommit),
+    Valid(LeaderBlockCommitOp),
+}
+
+#[derive(Debug, Clone)]
+struct LinkedCommitmentScore {
+    rel_block_height: u8,
+    op: LinkedCommitIdentifier,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct UserBurnIdentifier {
+    rel_block_height: u8,
+    key_vtxindex: u16,
+    key_block_ptr: u32,
+    block_hash: Hash160,
+}
+
+impl LinkedCommitIdentifier {
+    fn spent_txid(&self) -> &Txid {
+        match self {
+            LinkedCommitIdentifier::Missed(ref op) => &op.input.0,
+            LinkedCommitIdentifier::Valid(ref op) => &op.input.0,
+        }
+    }
+
+    fn spent_output(&self) -> u32 {
+        match self {
+            LinkedCommitIdentifier::Missed(ref op) => op.input.1,
+            LinkedCommitIdentifier::Valid(ref op) => op.input.1,
+        }
+    }
+
+    fn burn_fee(&self) -> u64 {
+        match self {
+            LinkedCommitIdentifier::Missed(_) => 1,
+            LinkedCommitIdentifier::Valid(ref op) => op.burn_fee,
+        }
+    }
+
+    fn txid(&self) -> &Txid {
+        match self {
+            LinkedCommitIdentifier::Missed(ref op) => &op.txid,
+            LinkedCommitIdentifier::Valid(ref op) => &op.txid,
+        }
+    }
+}
+
 impl BurnSamplePoint {
+    fn sanity_check_window(
+        block_commits: &Vec<Vec<LeaderBlockCommitOp>>,
+        missed_commits: &Vec<Vec<MissedBlockCommit>>,
+    ) {
+        assert!(block_commits.len() <= (MINING_COMMITMENT_WINDOW as usize));
+        assert_eq!(missed_commits.len() + 1, block_commits.len());
+        let mut block_height_at_index = None;
+        for (index, commits) in block_commits.iter().enumerate() {
+            let index = index as u64;
+            for commit in commits.iter() {
+                if let Some((first_block_height, first_index)) = block_height_at_index {
+                    assert_eq!(
+                        commit.block_height,
+                        first_block_height + (index - first_index),
+                        "Commits and Burns should be in block height order"
+                    );
+                } else {
+                    block_height_at_index = Some((commit.block_height, index));
+                }
+            }
+        }
+    }
+
     /// Make a burn distribution -- a list of (burn total, block candidate) pairs -- from a block's
-    /// block commits, leader keys, and user support burns.
+    /// block commits and user support burns.
     ///
-    /// All operations need to be from the same block height, or this method panics.
+    /// All operations need to be supplied in an ordered Vec of Vecs containing
+    ///   the ops at each block height in a mining commit window.  Normally, this window
+    ///   is the constant `MINING_COMMITMENT_WINDOW`, except during prepare-phases and post-PoX
+    ///   sunset.  In either of these two cases, the window is only one block.  The code does not
+    ///   consider which window is active; it merely deduces it by inspecting the length of the
+    ///   given `block_commits` argument.
     ///
-    /// If a key is used more than once (i.e. by two or more commits), then only the first commit
-    /// will be incorporated.  All other commits will be dropped.
+    /// If a burn refers to more than one commitment, its burn amount is *split* between those
+    ///   commitments
+    ///
+    ///  Burns are evaluated over the mining commitment window, where the effective burn for
+    ///   a commitment is := min(last_burn_amount, median over the window)
     ///
     /// Returns the distribution, which consumes the given lists of operations.
-    pub fn make_distribution(
-        all_block_candidates: Vec<LeaderBlockCommitOp>,
-        consumed_leader_keys: Vec<LeaderKeyRegisterOp>,
-        user_burns: Vec<UserBurnSupportOp>,
+    ///
+    /// * `block_commits`: this is a mapping from relative block_height to the block
+    ///     commits that occurred at that height. These relative block heights start
+    ///     at 0 and increment towards the present. When the mining window is 6, the
+    ///     "current" sortition's block commits would be in index 5.
+    /// * `missed_commits`: this is a mapping from relative block_height to the
+    ///     block commits that were intended to be included at that height. These
+    ///     relative block heights start at 0 and increment towards the present. There
+    ///     will be no such commits for the current sortition, so this vec will have
+    ///     `missed_commits.len() = block_commits.len() - 1`
+    /// * `burn_blocks`: this is a vector of booleans that indicate whether or not a block-commit
+    ///     occurred during a PoB-only sortition or a possibly-PoX sortition.  The former occurs
+    ///     during either a prepare phase or after PoX sunset, and must have only one (burn) output.
+    ///     The latter occurs everywhere else, and must have `OUTPUTS_PER_COMMIT` outputs after the
+    ///     `OP_RETURN` payload.  The length of this vector must be equal to the length of the
+    ///     `block_commits` vector.  `burn_blocks[i]` is `true` if the `ith` block-commit must be PoB.
+    pub fn make_min_median_distribution(
+        mut block_commits: Vec<Vec<LeaderBlockCommitOp>>,
+        mut missed_commits: Vec<Vec<MissedBlockCommit>>,
+        burn_blocks: Vec<bool>,
     ) -> Vec<BurnSamplePoint> {
-        // trivial case
-        if all_block_candidates.len() == 0 {
-            return vec![];
-        }
+        // sanity check
+        let window_size = block_commits.len() as u8;
+        assert!(window_size > 0);
+        BurnSamplePoint::sanity_check_window(&block_commits, &missed_commits);
+        assert_eq!(burn_blocks.len(), block_commits.len());
+        let global_burnchain_signer = monitoring::get_burnchain_signer();
 
-        BurnSamplePoint::ops_sanity_checks(&all_block_candidates, &user_burns);
+        // first, let's link all of the current block commits to the priors
+        let mut commits_with_priors: Vec<_> =
+            // start with the most recent
+            block_commits
+            .remove((window_size - 1) as usize)
+            .into_iter()
+            .map(|op| {
+                let mut linked_commits = vec![None; window_size as usize];
+                linked_commits[0] = Some(LinkedCommitmentScore {
+                        rel_block_height: window_size - 1,
+                        op: LinkedCommitIdentifier::Valid(op),
+                    });
+                linked_commits
+            })
+            .collect();
 
-        // map each leader key's position in the blockchain to its index in consumed_leader_keys.
-        // note that this effectively de-duplicates entries in consumed_leader_keys (see below)
-        let mut key_index: BTreeMap<(u64, u32), usize> = BTreeMap::new();
-        for i in 0..consumed_leader_keys.len() {
-            let key_loc = (
-                consumed_leader_keys[i].block_height,
-                consumed_leader_keys[i].vtxindex,
-            );
-            assert!(
-                key_index.get(&key_loc).is_none(),
-                format!("duplicate entry: {:?}", &key_loc)
-            );
+        for rel_block_height in (0..(window_size - 1)).rev() {
+            let cur_commits = block_commits.remove(rel_block_height as usize);
+            let cur_missed = missed_commits.remove(rel_block_height as usize);
+            // build a map from txid -> block commit for all the block commits
+            //   in the current block
+            let mut cur_commits_map: HashMap<_, _> = cur_commits
+                .into_iter()
+                .map(|commit| (commit.txid.clone(), commit))
+                .collect();
+            // build a map from txid -> missed block commit for the current block
+            let mut cur_missed_map: HashMap<_, _> = cur_missed
+                .into_iter()
+                .map(|missed| (missed.txid.clone(), missed))
+                .collect();
 
-            key_index.insert(key_loc, i);
-        }
+            // find the UTXO index that each last linked_commit must have spent in order to be
+            // chained to the block-commit (or missed-commit) at this relative block height
+            let commit_is_burn = burn_blocks[rel_block_height as usize];
+            let expected_index = LeaderBlockCommitOp::expected_chained_utxo(commit_is_burn);
 
-        // sanity check -- each block commit must refer to a consumed key
-        for i in 0..all_block_candidates.len() {
-            let bc = &all_block_candidates[i];
-            match key_index.get(&(bc.key_block_ptr as u64, bc.key_vtxindex as u32)) {
-                None => {
-                    panic!(
-                        "No leader key for block commitment {} at ({},{}) -- points to ({},{})",
-                        &bc.txid, bc.block_height, bc.vtxindex, bc.key_block_ptr, bc.key_vtxindex
-                    );
+            for linked_commit in commits_with_priors.iter_mut() {
+                let end = linked_commit.iter().rev().find_map(|o| o.as_ref()).unwrap(); // guaranteed to be at least 1 non-none entry
+
+                // if end spent a UTXO at this height, then it must match the expected index
+                if end.op.spent_output() != expected_index {
+                    test_debug!("Block-commit {} did not spent a UTXO at rel_block_height {}, because it spent output {},{} (expected {})",
+                                end.op.txid(), rel_block_height, end.op.spent_output(), end.op.spent_txid(), expected_index);
+                    continue;
                 }
-                Some(_) => {}
+
+                // find out which block-commit we chained to
+                let referenced_op = if let Some(referenced_commit) =
+                    cur_commits_map.remove(end.op.spent_txid())
+                {
+                    // found a chained utxo
+                    Some(LinkedCommitIdentifier::Valid(referenced_commit))
+                } else if let Some(missed_op) = cur_missed_map.remove(end.op.spent_txid()) {
+                    // found a missed commit
+                    Some(LinkedCommitIdentifier::Missed(missed_op))
+                } else {
+                    test_debug!(
+                            "No chained UTXO to a valid or missing commit at relative block height {} from {}: ({},{})",
+                            rel_block_height,
+                            end.op.txid(),
+                            end.op.spent_txid(),
+                            end.op.spent_output()
+                        );
+                    continue;
+                };
+
+                // if we found a referenced op, connect it
+                if let Some(referenced_op) = referenced_op {
+                    linked_commit[(window_size - 1 - rel_block_height) as usize] =
+                        Some(LinkedCommitmentScore {
+                            op: referenced_op,
+                            rel_block_height,
+                        });
+                }
             }
         }
 
-        // consume block candidates and leader keys to produce the list of burn sample points.
-        // If multiple commits try to use the same key, then take the first one (by vtxindex order)
-        // and drop the rest that consume the same key.
-        let mut burn_sample = Vec::with_capacity(all_block_candidates.len());
-        for i in 0..all_block_candidates.len() {
-            let bc = &all_block_candidates[i];
-            match key_index.get(&(bc.key_block_ptr as u64, bc.key_vtxindex as u32)) {
-                None => {
-                    // leader key already consumed; drop this commit
-                    warn!("VRF public key at {},{} already consumed; ignoring block commit {},{} ({})", bc.key_block_ptr, bc.key_vtxindex, bc.block_height, bc.vtxindex, bc.txid);
-                    continue;
-                }
-                Some(i) => {
-                    // next burn sample
-                    burn_sample.push(BurnSamplePoint {
-                        burns: bc.burn_fee as u128, // Initial burn weight is the block commitment's burn
-                        range_start: Uint256::zero(), // To be filled in
-                        range_end: Uint256::zero(), // To be filled in
-                        candidate: bc.clone(),
-                        key: consumed_leader_keys[*i].clone(),
-                        user_burns: vec![],
-                    });
-                }
-            };
+        // now, commits_with_priors has the burn amounts for each
+        //   linked commitment, we can now generate the burn sample points.
+        let mut burn_sample = commits_with_priors
+            .into_iter()
+            .map(|mut linked_commits| {
+                let mut all_burns: Vec<_> = linked_commits
+                    .iter()
+                    .map(|commit| {
+                        if let Some(commit) = commit {
+                            commit.op.burn_fee() as u128
+                        } else {
+                            // use 1 as the linked commit min. this gives a miner a _small_
+                            //  chance of winning a block even if they haven't performed chained utxos yet
+                            1
+                        }
+                    })
+                    .collect();
+                let most_recent_burn = all_burns[0];
 
-            // key consumed
-            key_index.remove(&(bc.key_block_ptr as u64, bc.key_vtxindex as u32));
-        }
+                all_burns.sort();
+                let median_burn = if window_size % 2 == 0 {
+                    (all_burns[(window_size / 2) as usize]
+                        + all_burns[(window_size / 2 - 1) as usize])
+                        / 2
+                } else {
+                    all_burns[(window_size / 2) as usize]
+                };
 
-        // assign user burns to the burn sample points
-        BurnSamplePoint::apply_user_burns(&mut burn_sample, user_burns);
+                let burns = cmp::min(median_burn, most_recent_burn);
+                let candidate = if let LinkedCommitIdentifier::Valid(op) =
+                    linked_commits.remove(0).unwrap().op
+                {
+                    op
+                } else {
+                    unreachable!("BUG: first linked commit should always be valid");
+                };
+                assert_eq!(candidate.burn_fee as u128, most_recent_burn);
+
+                debug!("Burn sample";
+                       "txid" => %candidate.txid.to_string(),
+                       "most_recent_burn" => %most_recent_burn,
+                       "median_burn" => %median_burn,
+                       "all_burns" => %format!("{:?}", all_burns));
+
+                // prometheus: log miner commitment
+                if let Some(signer) = &global_burnchain_signer {
+                    if candidate.apparent_sender == *signer {
+                        monitoring::update_computed_miner_commitment(burns);
+                        monitoring::update_miner_current_median_commitment(median_burn);
+                    }
+                }
+                BurnSamplePoint {
+                    burns,
+                    range_start: Uint256::zero(), // To be filled in
+                    range_end: Uint256::zero(),   // To be filled in
+                    candidate,
+                    user_burns: vec![],
+                }
+            })
+            .collect();
 
         // calculate burn ranges
         BurnSamplePoint::make_sortition_ranges(&mut burn_sample);
+
+        // prometheus: calculate miner relative score
+        if let Some(signer) = global_burnchain_signer {
+            let mut range_total = Uint256::zero();
+            let mut signer_seen = false;
+            for burn in burn_sample.iter() {
+                if burn.candidate.apparent_sender == signer {
+                    signer_seen = true;
+                    range_total = range_total + (burn.range_end - burn.range_start);
+                }
+            }
+            if signer_seen {
+                monitoring::update_computed_relative_miner_score(range_total);
+            }
+        }
         burn_sample
     }
 
-    // sanity checks for making a burn distribution
-    fn ops_sanity_checks(
-        block_candidates: &Vec<LeaderBlockCommitOp>,
-        user_burns: &Vec<UserBurnSupportOp>,
-    ) -> () {
-        // sanity checks
-        if block_candidates.len() > 1 {
-            let block_height = block_candidates[0].block_height;
-            for i in 1..block_candidates.len() {
-                if block_candidates[i].block_height != block_height {
-                    panic!(
-                        "FATAL ERROR: block commit {} is at ({},{}) not {}",
-                        &block_candidates[i].txid,
-                        block_candidates[i].block_height,
-                        block_candidates[i].vtxindex,
-                        block_height
-                    );
-                }
-            }
-
-            for i in 0..block_candidates.len() - 1 {
-                if block_candidates[i].vtxindex >= block_candidates[i + 1].vtxindex {
-                    panic!("FATAL ERROR: block candidates are not in order");
-                }
-            }
-        }
-
-        if user_burns.len() > 1 {
-            let block_height = user_burns[0].block_height;
-            for i in 0..user_burns.len() {
-                if user_burns[i].block_height != block_height {
-                    panic!(
-                        "FATAL ERROR: user burn {} is at ({},{}) not {}",
-                        &user_burns[i].txid,
-                        user_burns[i].block_height,
-                        user_burns[i].vtxindex,
-                        block_height
-                    );
-                }
-            }
-
-            for i in 0..user_burns.len() - 1 {
-                if user_burns[i].vtxindex >= user_burns[i + 1].vtxindex {
-                    panic!("FATAL ERROR: user burns are not in order");
-                }
-            }
-        }
-    }
-
-    /// Move a list of user burns into their burn sample points.
-    fn apply_user_burns(
-        burn_sample: &mut Vec<BurnSamplePoint>,
+    #[cfg(test)]
+    pub fn make_distribution(
+        all_block_candidates: Vec<LeaderBlockCommitOp>,
+        _consumed_leader_keys: Vec<LeaderKeyRegisterOp>,
         user_burns: Vec<UserBurnSupportOp>,
-    ) -> () {
-        // map each burn sample's (VRF public key, block hash 160) pair to its index.
-        // The pair will be unique, since the DB requires each VRF key to be unique.
-        // Hovever, the block hash 160 is not guaranteed to be unique -- two different
-        // leaders can burn for the same block.
-        let mut burn_index: BTreeMap<(VRFPublicKey, Hash160), usize> = BTreeMap::new();
-        for i in 0..burn_sample.len() {
-            let block_header_hash_160 =
-                Hash160::from_sha256(&burn_sample[i].candidate.block_header_hash.as_bytes());
-            let vrf_pubkey = burn_sample[i].key.public_key.clone();
-            let key = (vrf_pubkey, block_header_hash_160);
-            assert!(burn_index.get(&key).is_none());
-
-            burn_index.insert(key, i);
-        }
-
-        // match user burns to the leaders
-        for user_burn in user_burns {
-            let key = (
-                user_burn.public_key.clone(),
-                user_burn.block_header_hash_160.clone(),
-            );
-            match burn_index.get(&key) {
-                Some(block_idx) => {
-                    // user burn matches a (key, block) pair committed to in this block
-                    let idx = *block_idx;
-                    burn_sample[idx].burns += user_burn.burn_fee as u128;
-                    burn_sample[idx].user_burns.push(user_burn.clone());
-                }
-                None => {
-                    debug!("User burn {} ({},{}) of {} for key={}, block={} has no matching block commit",
-                          &user_burn.txid, user_burn.block_height, user_burn.vtxindex, user_burn.burn_fee,
-                          user_burn.public_key.to_hex(), &user_burn.block_header_hash_160);
-                    continue;
-                }
-            };
-        }
+    ) -> Vec<BurnSamplePoint> {
+        Self::make_min_median_distribution(vec![all_block_candidates], vec![], vec![true])
     }
 
     /// Calculate the ranges between 0 and 2**256 - 1 over which each point in the burn sample
@@ -281,65 +384,446 @@ impl BurnSamplePoint {
 
     /// Calculate the total amount of crypto destroyed in this burn distribution.
     /// Returns None if there was an overflow.
-    pub fn get_total_burns(burn_dist: &Vec<BurnSamplePoint>) -> Option<u64> {
-        let block_burn_total_u128: u128 =
-            burn_dist
-                .iter()
-                .fold(0u128, |mut burns_so_far, sample_point| {
-                    burns_so_far += sample_point.burns;
-                    burns_so_far
-                });
-
-        // check overflow
-        if block_burn_total_u128 >= u64::max_value().into() {
-            return None;
-        }
-        let block_burn_total = block_burn_total_u128 as u64;
-        Some(block_burn_total)
+    pub fn get_total_burns(burn_dist: &[BurnSamplePoint]) -> Option<u64> {
+        burn_dist
+            .iter()
+            .fold(Some(0), |burns_so_far, sample_point| {
+                if let Some(burns_so_far) = burns_so_far {
+                    burns_so_far.checked_add(sample_point.burns.try_into().ok()?)
+                } else {
+                    None
+                }
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::BurnSamplePoint;
-
     use std::marker::PhantomData;
 
+    use crate::types::chainstate::StacksAddress;
+    use address::AddressHashMode;
+    use burnchains::bitcoin::address::BitcoinAddress;
+    use burnchains::bitcoin::keys::BitcoinPublicKey;
+    use burnchains::bitcoin::BitcoinNetworkType;
     use burnchains::Address;
     use burnchains::Burnchain;
     use burnchains::BurnchainSigner;
     use burnchains::PublicKey;
-
+    use burnchains::Txid;
     use chainstate::burn::operations::{
-        BlockstackOperation, BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp,
-        UserBurnSupportOp,
+        leader_block_commit::{MissedBlockCommit, BURN_BLOCK_MINED_AT_MODULUS},
+        BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp, UserBurnSupportOp,
     };
-
-    use burnchains::bitcoin::address::BitcoinAddress;
-    use burnchains::bitcoin::keys::BitcoinPublicKey;
-    use burnchains::bitcoin::BitcoinNetworkType;
-
-    use burnchains::{BurnchainHeaderHash, Txid};
-    use chainstate::burn::{BlockHeaderHash, ConsensusHash, VRFSeed};
+    use chainstate::burn::ConsensusHash;
+    use chainstate::stacks::StacksPublicKey;
+    use core::MINING_COMMITMENT_WINDOW;
     use util::hash::hex_bytes;
-    use util::vrf::VRFPublicKey;
-
     use util::hash::Hash160;
+    use util::log;
     use util::uint::BitArray;
     use util::uint::Uint256;
     use util::uint::Uint512;
+    use util::vrf::*;
 
-    use util::log;
+    use crate::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash};
+    use crate::types::chainstate::{SortitionId, VRFSeed};
 
-    use address::AddressHashMode;
-    use chainstate::stacks::StacksAddress;
-    use chainstate::stacks::StacksPublicKey;
+    use super::BurnSamplePoint;
 
     struct BurnDistFixture {
         consumed_leader_keys: Vec<LeaderKeyRegisterOp>,
         block_commits: Vec<LeaderBlockCommitOp>,
         user_burns: Vec<UserBurnSupportOp>,
         res: Vec<BurnSamplePoint>,
+    }
+
+    fn make_user_burn(
+        burn_fee: u64,
+        vrf_ident: u32,
+        block_id: u64,
+        txid_id: u64,
+        block_height: u64,
+    ) -> UserBurnSupportOp {
+        let mut block_header_hash = [0; 32];
+        block_header_hash[0..8].copy_from_slice(&block_id.to_be_bytes());
+        let mut txid = [3; 32];
+        txid[0..8].copy_from_slice(&txid_id.to_be_bytes());
+        let txid = Txid(txid);
+
+        UserBurnSupportOp {
+            address: StacksAddress {
+                version: 0,
+                bytes: Hash160([0; 20]),
+            },
+            consensus_hash: ConsensusHash([0; 20]),
+            public_key: VRFPublicKey::from_private(&VRFPrivateKey::new()),
+            key_block_ptr: vrf_ident,
+            key_vtxindex: 0,
+            block_header_hash_160: Hash160::from_sha256(&block_header_hash),
+            burn_fee,
+            txid,
+            vtxindex: 0,  // index in the block where this tx occurs
+            block_height, // block height at which this tx occurs
+            burn_header_hash: BurnchainHeaderHash([0; 32]), // hash of burnchain block with this tx
+        }
+    }
+
+    fn make_missed_commit(txid_id: u64, input_tx: u64) -> MissedBlockCommit {
+        let mut txid = [0; 32];
+        txid[0..8].copy_from_slice(&txid_id.to_be_bytes());
+        let mut input_txid = [0; 32];
+        input_txid[0..8].copy_from_slice(&input_tx.to_be_bytes());
+        let txid = Txid(txid);
+        let input_txid = Txid(input_txid);
+        MissedBlockCommit {
+            txid,
+            input: (input_txid, 3),
+            intended_sortition: SortitionId([0; 32]),
+        }
+    }
+
+    fn make_block_commit(
+        burn_fee: u64,
+        vrf_ident: u32,
+        block_id: u64,
+        txid_id: u64,
+        input_tx: Option<u64>,
+        block_ht: u64,
+    ) -> LeaderBlockCommitOp {
+        let mut block_header_hash = [0; 32];
+        block_header_hash[0..8].copy_from_slice(&block_id.to_be_bytes());
+        let mut txid = [0; 32];
+        txid[0..8].copy_from_slice(&txid_id.to_be_bytes());
+        let mut input_txid = [0; 32];
+        if let Some(input_tx) = input_tx {
+            input_txid[0..8].copy_from_slice(&input_tx.to_be_bytes());
+        } else {
+            // no txid will match
+            input_txid.copy_from_slice(&[1; 32]);
+        }
+        let txid = Txid(txid);
+        let input_txid = Txid(input_txid);
+
+        LeaderBlockCommitOp {
+            block_header_hash: BlockHeaderHash(block_header_hash),
+            new_seed: VRFSeed([0; 32]),
+            parent_block_ptr: (block_id - 1) as u32,
+            parent_vtxindex: 0,
+            key_block_ptr: vrf_ident,
+            key_vtxindex: 0,
+            memo: vec![],
+            burn_fee,
+            input: (input_txid, 3),
+            apparent_sender: BurnchainSigner::new_p2pkh(&StacksPublicKey::new()),
+            commit_outs: vec![],
+            sunset_burn: 0,
+            txid,
+            vtxindex: 0,
+            block_height: block_ht,
+            burn_parent_modulus: if block_ht > 0 {
+                ((block_ht - 1) % BURN_BLOCK_MINED_AT_MODULUS) as u8
+            } else {
+                BURN_BLOCK_MINED_AT_MODULUS as u8 - 1
+            },
+            burn_header_hash: BurnchainHeaderHash([0; 32]),
+        }
+    }
+
+    #[test]
+    fn make_mean_min_median_sunset_in_window() {
+        //    miner 1:  3 4 5 4 5 4
+        //       ub  :  1 0 0 0 0 0
+        //                    | sunset end
+        //    miner 2:  1 3 3 3 3 3
+        //       ub  :  1 0 0 0 0 0
+        //              0 1 0 0 0 0
+        //                   ..
+
+        // miner 1 => min = 1, median = 1, last_burn = 4
+        // miner 2 => min = 1, median = 1, last_burn = 3
+
+        let mut commits = vec![
+            vec![
+                make_block_commit(3, 1, 1, 1, None, 1),
+                make_block_commit(1, 2, 2, 2, None, 1),
+            ],
+            vec![
+                make_block_commit(4, 3, 3, 3, Some(1), 2),
+                make_block_commit(3, 4, 4, 4, Some(2), 2),
+            ],
+            vec![
+                make_block_commit(5, 5, 5, 5, Some(3), 3),
+                make_block_commit(3, 6, 6, 6, Some(4), 3),
+            ],
+            vec![
+                make_block_commit(4, 7, 7, 7, Some(5), 4),
+                make_block_commit(3, 8, 8, 8, Some(6), 4),
+            ],
+            vec![
+                make_block_commit(5, 9, 9, 9, Some(7), 5),
+                make_block_commit(3, 10, 10, 10, Some(8), 5),
+            ],
+            vec![
+                make_block_commit(4, 11, 11, 11, Some(9), 6),
+                make_block_commit(3, 12, 12, 12, Some(10), 6),
+            ],
+        ];
+        let user_burns = vec![
+            vec![make_user_burn(1, 1, 1, 1, 1), make_user_burn(1, 2, 2, 2, 1)],
+            vec![make_user_burn(1, 4, 4, 4, 2)],
+            vec![make_user_burn(1, 6, 6, 6, 3)],
+            vec![make_user_burn(1, 8, 8, 8, 4)],
+            vec![make_user_burn(1, 10, 10, 10, 5)],
+            vec![make_user_burn(1, 12, 12, 12, 6)],
+        ];
+
+        let mut result = BurnSamplePoint::make_min_median_distribution(
+            commits.clone(),
+            vec![vec![]; (MINING_COMMITMENT_WINDOW - 1) as usize],
+            vec![false, false, false, true, true, true],
+        );
+
+        assert_eq!(result.len(), 2, "Should be two miners");
+
+        result.sort_by_key(|sample| sample.candidate.txid);
+
+        // block-commits are currently malformed -- the post-sunset commits spend the wrong UTXO.
+        assert_eq!(result[0].burns, 1);
+        assert_eq!(result[1].burns, 1);
+
+        // make sure that we're associating with the last commit in the window.
+        assert_eq!(result[0].candidate.txid, commits[5][0].txid);
+        assert_eq!(result[1].candidate.txid, commits[5][1].txid);
+
+        assert_eq!(result[0].user_burns.len(), 0);
+        assert_eq!(result[1].user_burns.len(), 0);
+
+        // now correct the back pointers so that they point
+        //   at the correct UTXO position *post-sunset*
+        for (ix, window_slice) in commits.iter_mut().enumerate() {
+            if ix >= 4 {
+                for commit in window_slice.iter_mut() {
+                    commit.input.1 = 2;
+                }
+            }
+        }
+
+        //    miner 1:  3 4 5 4 5 4
+        //    miner 2:  1 3 3 3 3 3
+        // miner 1 => min = 3, median = 4, last_burn = 4
+        // miner 2 => min = 1, median = 3, last_burn = 3
+
+        let mut result = BurnSamplePoint::make_min_median_distribution(
+            commits.clone(),
+            vec![vec![]; (MINING_COMMITMENT_WINDOW - 1) as usize],
+            vec![false, false, false, true, true, true],
+        );
+
+        assert_eq!(result.len(), 2, "Should be two miners");
+
+        result.sort_by_key(|sample| sample.candidate.txid);
+
+        assert_eq!(result[0].burns, 4);
+        assert_eq!(result[1].burns, 3);
+
+        // make sure that we're associating with the last commit in the window.
+        assert_eq!(result[0].candidate.txid, commits[5][0].txid);
+        assert_eq!(result[1].candidate.txid, commits[5][1].txid);
+
+        assert_eq!(result[0].user_burns.len(), 0);
+        assert_eq!(result[1].user_burns.len(), 0);
+    }
+
+    #[test]
+    fn make_mean_min_median() {
+        // test case 1:
+        //    miner 1:  3 4 5 4 5 4
+        //       ub  :  1 0 0 0 0 0
+        //    miner 2:  1 3 3 3 3 3
+        //       ub  :  1 0 0 0 0 0
+        //              0 1 0 0 0 0
+        //                   ..
+
+        // user burns are ignored:
+        //
+        // miner 1 => min = 3, median = 4, last_burn = 4
+        // miner 2 => min = 1, median = 3, last_burn = 3
+
+        let commits = vec![
+            vec![
+                make_block_commit(3, 1, 1, 1, None, 1),
+                make_block_commit(1, 2, 2, 2, None, 1),
+            ],
+            vec![
+                make_block_commit(4, 3, 3, 3, Some(1), 2),
+                make_block_commit(3, 4, 4, 4, Some(2), 2),
+            ],
+            vec![
+                make_block_commit(5, 5, 5, 5, Some(3), 3),
+                make_block_commit(3, 6, 6, 6, Some(4), 3),
+            ],
+            vec![
+                make_block_commit(4, 7, 7, 7, Some(5), 4),
+                make_block_commit(3, 8, 8, 8, Some(6), 4),
+            ],
+            vec![
+                make_block_commit(5, 9, 9, 9, Some(7), 5),
+                make_block_commit(3, 10, 10, 10, Some(8), 5),
+            ],
+            vec![
+                make_block_commit(4, 11, 11, 11, Some(9), 6),
+                make_block_commit(3, 12, 12, 12, Some(10), 6),
+            ],
+        ];
+        let user_burns = vec![
+            vec![make_user_burn(1, 1, 1, 1, 1), make_user_burn(1, 2, 2, 2, 1)],
+            vec![make_user_burn(1, 4, 4, 4, 2)],
+            vec![make_user_burn(1, 6, 6, 6, 3)],
+            vec![make_user_burn(1, 8, 8, 8, 4)],
+            vec![make_user_burn(1, 10, 10, 10, 5)],
+            vec![make_user_burn(1, 12, 12, 12, 6)],
+        ];
+
+        let mut result = BurnSamplePoint::make_min_median_distribution(
+            commits.clone(),
+            vec![vec![]; (MINING_COMMITMENT_WINDOW - 1) as usize],
+            vec![false, false, false, false, false, false],
+        );
+
+        assert_eq!(result.len(), 2, "Should be two miners");
+
+        result.sort_by_key(|sample| sample.candidate.txid);
+
+        assert_eq!(result[0].burns, 4);
+        assert_eq!(result[1].burns, 3);
+
+        // make sure that we're associating with the last commit in the window.
+        assert_eq!(result[0].candidate.txid, commits[5][0].txid);
+        assert_eq!(result[1].candidate.txid, commits[5][1].txid);
+
+        assert_eq!(result[0].user_burns.len(), 0);
+        assert_eq!(result[1].user_burns.len(), 0);
+
+        // test case 2:
+        //    miner 1:  4 4 5 4 5 3
+        //    miner 2:  4 4 4 4 4 1
+        //       ub  :  0 0 0 0 0 2
+        //               *split*
+
+        // miner 1 => min = 3, median = 4, last_burn = 3
+        // miner 2 => min = 1, median = 4, last_burn = 1
+
+        let commits = vec![
+            vec![
+                make_block_commit(4, 1, 1, 1, None, 1),
+                make_block_commit(4, 2, 2, 2, None, 1),
+            ],
+            vec![
+                make_block_commit(4, 3, 3, 3, Some(1), 2),
+                make_block_commit(4, 4, 4, 4, Some(2), 2),
+            ],
+            vec![
+                make_block_commit(5, 5, 5, 5, Some(3), 3),
+                make_block_commit(4, 6, 6, 6, Some(4), 3),
+            ],
+            vec![
+                make_block_commit(4, 7, 7, 7, Some(5), 4),
+                make_block_commit(4, 8, 8, 8, Some(6), 4),
+            ],
+            vec![
+                make_block_commit(5, 9, 9, 9, Some(7), 5),
+                make_block_commit(4, 10, 10, 10, Some(8), 5),
+            ],
+            vec![
+                make_block_commit(3, 11, 11, 11, Some(9), 6),
+                make_block_commit(1, 11, 11, 12, Some(10), 6),
+            ],
+        ];
+        let user_burns = vec![
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![make_user_burn(2, 11, 11, 1, 6)],
+        ];
+
+        let mut result = BurnSamplePoint::make_min_median_distribution(
+            commits.clone(),
+            vec![vec![]; (MINING_COMMITMENT_WINDOW - 1) as usize],
+            vec![false, false, false, false, false, false],
+        );
+
+        assert_eq!(result.len(), 2, "Should be two miners");
+
+        result.sort_by_key(|sample| sample.candidate.txid);
+
+        assert_eq!(result[0].burns, 3);
+        assert_eq!(result[1].burns, 1);
+
+        // make sure that we're associating with the last commit in the window.
+        assert_eq!(result[0].candidate.txid, commits[5][0].txid);
+        assert_eq!(result[1].candidate.txid, commits[5][1].txid);
+
+        assert_eq!(result[0].user_burns.len(), 0);
+        assert_eq!(result[1].user_burns.len(), 0);
+    }
+
+    #[test]
+    fn missed_block_commits() {
+        // test case 1:
+        //    miner 1:  3 4 5 4 missed 4
+        //    miner 2:  3 3 missed 3 3 3
+        //
+        // miner 1 => min = 0, median = 4, last_burn = 4
+        // miner 2 => min = 0, median = 3, last_burn = 3
+
+        let commits = vec![
+            vec![
+                make_block_commit(3, 1, 1, 1, None, 1),
+                make_block_commit(1, 2, 2, 2, None, 1),
+            ],
+            vec![
+                make_block_commit(4, 3, 3, 3, Some(1), 2),
+                make_block_commit(3, 4, 4, 4, Some(2), 2),
+            ],
+            vec![make_block_commit(5, 5, 5, 5, Some(3), 3)],
+            vec![
+                make_block_commit(4, 7, 7, 7, Some(5), 4),
+                make_block_commit(3, 8, 8, 8, Some(6), 4),
+            ],
+            vec![make_block_commit(3, 10, 10, 10, Some(8), 5)],
+            vec![
+                make_block_commit(4, 11, 11, 11, Some(9), 6),
+                make_block_commit(3, 12, 12, 12, Some(10), 6),
+            ],
+        ];
+
+        let missed_commits = vec![
+            vec![],
+            vec![],
+            vec![make_missed_commit(6, 4)],
+            vec![],
+            vec![make_missed_commit(9, 7)],
+        ];
+
+        let mut result = BurnSamplePoint::make_min_median_distribution(
+            commits.clone(),
+            missed_commits.clone(),
+            vec![false, false, false, false, false, false],
+        );
+
+        assert_eq!(result.len(), 2, "Should be two miners");
+
+        result.sort_by_key(|sample| sample.candidate.txid);
+
+        assert_eq!(result[0].burns, 4);
+        assert_eq!(result[1].burns, 3);
+
+        // make sure that we're associating with the last commit in the window.
+        assert_eq!(result[0].candidate.txid, commits[5][0].txid);
+        assert_eq!(result[1].candidate.txid, commits[5][1].txid);
     }
 
     #[test]
@@ -638,6 +1122,7 @@ mod tests {
         };
 
         let block_commit_1 = LeaderBlockCommitOp {
+            sunset_burn: 0,
             block_header_hash: BlockHeaderHash::from_bytes(
                 &hex_bytes("2222222222222222222222222222222222222222222222222222222222222222")
                     .unwrap(),
@@ -655,7 +1140,8 @@ mod tests {
             memo: vec![0x80],
 
             burn_fee: 12345,
-            input: BurnchainSigner {
+            input: (Txid([0; 32]), 0),
+            apparent_sender: BurnchainSigner {
                 public_keys: vec![StacksPublicKey::from_hex(
                     "02d8015134d9db8178ac93acbc43170a2f20febba5087a5b0437058765ad5133d0",
                 )
@@ -663,6 +1149,7 @@ mod tests {
                 num_sigs: 1,
                 hash_mode: AddressHashMode::SerializeP2PKH,
             },
+
             commit_outs: vec![],
 
             txid: Txid::from_bytes_be(
@@ -672,6 +1159,7 @@ mod tests {
             .unwrap(),
             vtxindex: 443,
             block_height: 124,
+            burn_parent_modulus: (123 % BURN_BLOCK_MINED_AT_MODULUS) as u8,
             burn_header_hash: BurnchainHeaderHash::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000004",
             )
@@ -679,6 +1167,7 @@ mod tests {
         };
 
         let block_commit_2 = LeaderBlockCommitOp {
+            sunset_burn: 0,
             block_header_hash: BlockHeaderHash::from_bytes(
                 &hex_bytes("2222222222222222222222222222222222222222222222222222222222222223")
                     .unwrap(),
@@ -696,7 +1185,8 @@ mod tests {
             memo: vec![0x80],
 
             burn_fee: 12345,
-            input: BurnchainSigner {
+            input: (Txid([0; 32]), 0),
+            apparent_sender: BurnchainSigner {
                 public_keys: vec![StacksPublicKey::from_hex(
                     "02d8015134d9db8178ac93acbc43170a2f20febba5087a5b0437058765ad5133d0",
                 )
@@ -704,6 +1194,7 @@ mod tests {
                 num_sigs: 1,
                 hash_mode: AddressHashMode::SerializeP2PKH,
             },
+
             commit_outs: vec![],
 
             txid: Txid::from_bytes_be(
@@ -713,6 +1204,7 @@ mod tests {
             .unwrap(),
             vtxindex: 444,
             block_height: 124,
+            burn_parent_modulus: (123 % BURN_BLOCK_MINED_AT_MODULUS) as u8,
             burn_header_hash: BurnchainHeaderHash::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000004",
             )
@@ -720,6 +1212,7 @@ mod tests {
         };
 
         let block_commit_3 = LeaderBlockCommitOp {
+            sunset_burn: 0,
             block_header_hash: BlockHeaderHash::from_bytes(
                 &hex_bytes("2222222222222222222222222222222222222222222222222222222222222224")
                     .unwrap(),
@@ -737,7 +1230,8 @@ mod tests {
             memo: vec![0x80],
 
             burn_fee: 23456,
-            input: BurnchainSigner {
+            input: (Txid([0; 32]), 0),
+            apparent_sender: BurnchainSigner {
                 public_keys: vec![StacksPublicKey::from_hex(
                     "02d8015134d9db8178ac93acbc43170a2f20febba5087a5b0437058765ad5133d0",
                 )
@@ -745,6 +1239,7 @@ mod tests {
                 num_sigs: 1,
                 hash_mode: AddressHashMode::SerializeP2PKH,
             },
+
             commit_outs: vec![],
 
             txid: Txid::from_bytes_be(
@@ -754,6 +1249,7 @@ mod tests {
             .unwrap(),
             vtxindex: 445,
             block_height: 124,
+            burn_parent_modulus: (123 % BURN_BLOCK_MINED_AT_MODULUS) as u8,
             burn_header_hash: BurnchainHeaderHash::from_hex(
                 "0000000000000000000000000000000000000000000000000000000000000004",
             )
@@ -793,7 +1289,6 @@ mod tests {
                     range_start: Uint256::zero(),
                     range_end: Uint256::max(),
                     candidate: block_commit_1.clone(),
-                    key: leader_key_1.clone(),
                     user_burns: vec![],
                 }],
             },
@@ -812,7 +1307,6 @@ mod tests {
                             0x7fffffffffffffff,
                         ]),
                         candidate: block_commit_1.clone(),
-                        key: leader_key_1.clone(),
                         user_burns: vec![],
                     },
                     BurnSamplePoint {
@@ -825,7 +1319,6 @@ mod tests {
                         ]),
                         range_end: Uint256::max(),
                         candidate: block_commit_2.clone(),
-                        key: leader_key_2.clone(),
                         user_burns: vec![],
                     },
                 ],
@@ -845,7 +1338,6 @@ mod tests {
                             0x7fffffffffffffff,
                         ]),
                         candidate: block_commit_1.clone(),
-                        key: leader_key_1.clone(),
                         user_burns: vec![],
                     },
                     BurnSamplePoint {
@@ -858,7 +1350,6 @@ mod tests {
                         ]),
                         range_end: Uint256::max(),
                         candidate: block_commit_2.clone(),
-                        key: leader_key_2.clone(),
                         user_burns: vec![],
                     },
                 ],
@@ -878,7 +1369,6 @@ mod tests {
                             0x7fffffffffffffff,
                         ]),
                         candidate: block_commit_1.clone(),
-                        key: leader_key_1.clone(),
                         user_burns: vec![],
                     },
                     BurnSamplePoint {
@@ -891,7 +1381,6 @@ mod tests {
                         ]),
                         range_end: Uint256::max(),
                         candidate: block_commit_2.clone(),
-                        key: leader_key_2.clone(),
                         user_burns: vec![],
                     },
                 ],
@@ -906,29 +1395,27 @@ mod tests {
                 ],
                 res: vec![
                     BurnSamplePoint {
-                        burns: (block_commit_1.burn_fee + user_burn_1.burn_fee).into(),
+                        burns: block_commit_1.burn_fee.into(),
                         range_start: Uint256::zero(),
                         range_end: Uint256([
-                            0x441d393138e5a796,
-                            0xbada4a3d4046d839,
-                            0xa24749933957018c,
-                            0xa4e5f328cf38744d,
+                            0xffffffffffffffff,
+                            0xffffffffffffffff,
+                            0xffffffffffffffff,
+                            0x7fffffffffffffff,
                         ]),
                         candidate: block_commit_1.clone(),
-                        key: leader_key_1.clone(),
-                        user_burns: vec![user_burn_1.clone()],
+                        user_burns: vec![],
                     },
                     BurnSamplePoint {
                         burns: block_commit_2.burn_fee.into(),
                         range_start: Uint256([
-                            0x441d393138e5a796,
-                            0xbada4a3d4046d839,
-                            0xa24749933957018c,
-                            0xa4e5f328cf38744d,
+                            0xffffffffffffffff,
+                            0xffffffffffffffff,
+                            0xffffffffffffffff,
+                            0x7fffffffffffffff,
                         ]),
                         range_end: Uint256::max(),
                         candidate: block_commit_2.clone(),
-                        key: leader_key_2.clone(),
                         user_burns: vec![],
                     },
                 ],
@@ -944,30 +1431,28 @@ mod tests {
                 ],
                 res: vec![
                     BurnSamplePoint {
-                        burns: (block_commit_1.burn_fee + user_burn_1.burn_fee).into(),
+                        burns: block_commit_1.burn_fee.into(),
                         range_start: Uint256::zero(),
                         range_end: Uint256([
-                            0x65db6527a5c06ed7,
-                            0xfbf9725ae754dd80,
-                            0xeafb8d991cf9964d,
-                            0x6898693a2f1713b4,
+                            0xffffffffffffffff,
+                            0xffffffffffffffff,
+                            0xffffffffffffffff,
+                            0x7fffffffffffffff,
                         ]),
                         candidate: block_commit_1.clone(),
-                        key: leader_key_1.clone(),
-                        user_burns: vec![user_burn_1.clone()],
+                        user_burns: vec![],
                     },
                     BurnSamplePoint {
-                        burns: (block_commit_2.burn_fee + user_burn_2.burn_fee).into(),
+                        burns: block_commit_2.burn_fee.into(),
                         range_start: Uint256([
-                            0x65db6527a5c06ed7,
-                            0xfbf9725ae754dd80,
-                            0xeafb8d991cf9964d,
-                            0x6898693a2f1713b4,
+                            0xffffffffffffffff,
+                            0xffffffffffffffff,
+                            0xffffffffffffffff,
+                            0x7fffffffffffffff,
                         ]),
                         range_end: Uint256::max(),
                         candidate: block_commit_2.clone(),
-                        key: leader_key_2.clone(),
-                        user_burns: vec![user_burn_2.clone()],
+                        user_burns: vec![],
                     },
                 ],
             },
@@ -984,36 +1469,28 @@ mod tests {
                 ],
                 res: vec![
                     BurnSamplePoint {
-                        burns: (block_commit_1.burn_fee
-                            + user_burn_1.burn_fee
-                            + user_burn_1_2.burn_fee)
-                            .into(),
+                        burns: block_commit_1.burn_fee.into(),
                         range_start: Uint256::zero(),
                         range_end: Uint256([
-                            0xbc9e168afe8ad47e,
-                            0xbbb6d3eb8d1be6c9,
-                            0x45a410039d0a7dc5,
-                            0x6b7815d84b0f9fc0,
+                            0xffffffffffffffff,
+                            0xffffffffffffffff,
+                            0xffffffffffffffff,
+                            0x7fffffffffffffff,
                         ]),
                         candidate: block_commit_1.clone(),
-                        key: leader_key_1.clone(),
-                        user_burns: vec![user_burn_1.clone(), user_burn_1_2.clone()],
+                        user_burns: vec![],
                     },
                     BurnSamplePoint {
-                        burns: (block_commit_2.burn_fee
-                            + user_burn_2.burn_fee
-                            + user_burn_2_2.burn_fee)
-                            .into(),
+                        burns: block_commit_2.burn_fee.into(),
                         range_start: Uint256([
-                            0xbc9e168afe8ad47e,
-                            0xbbb6d3eb8d1be6c9,
-                            0x45a410039d0a7dc5,
-                            0x6b7815d84b0f9fc0,
+                            0xffffffffffffffff,
+                            0xffffffffffffffff,
+                            0xffffffffffffffff,
+                            0x7fffffffffffffff,
                         ]),
                         range_end: Uint256::max(),
                         candidate: block_commit_2.clone(),
-                        key: leader_key_2.clone(),
-                        user_burns: vec![user_burn_2.clone(), user_burn_2_2.clone()],
+                        user_burns: vec![],
                     },
                 ],
             },
@@ -1038,53 +1515,44 @@ mod tests {
                 ],
                 res: vec![
                     BurnSamplePoint {
-                        burns: (block_commit_1.burn_fee
-                            + user_burn_1.burn_fee
-                            + user_burn_1_2.burn_fee)
-                            .into(),
+                        burns: block_commit_1.burn_fee.into(),
                         range_start: Uint256::zero(),
                         range_end: Uint256([
-                            0xcb48ed15c5086a5c,
-                            0x6b29682cfbe4089c,
-                            0x4a30e732285c18c9,
-                            0x5a7416b691bddbad,
+                            0x3ed94d3cb0a84709,
+                            0x0963dded799a7c1a,
+                            0x70989faf596c8b65,
+                            0x41a3ed94d3cb0a84,
                         ]),
                         candidate: block_commit_1.clone(),
-                        key: leader_key_1.clone(),
-                        user_burns: vec![user_burn_1.clone(), user_burn_1_2.clone()],
+                        user_burns: vec![],
                     },
                     BurnSamplePoint {
-                        burns: (block_commit_2.burn_fee
-                            + user_burn_2.burn_fee
-                            + user_burn_2_2.burn_fee)
-                            .into(),
+                        burns: block_commit_2.burn_fee.into(),
                         range_start: Uint256([
-                            0xcb48ed15c5086a5c,
-                            0x6b29682cfbe4089c,
-                            0x4a30e732285c18c9,
-                            0x5a7416b691bddbad,
+                            0x3ed94d3cb0a84709,
+                            0x0963dded799a7c1a,
+                            0x70989faf596c8b65,
+                            0x41a3ed94d3cb0a84,
                         ]),
                         range_end: Uint256([
-                            0xa224e0451efa00f5,
-                            0xa57394a7b38d5b1c,
-                            0x6bfdbf24cdb0b617,
-                            0xd777aa6d9e769e59,
+                            0x7db29a7961508e12,
+                            0x12c7bbdaf334f834,
+                            0xe1313f5eb2d916ca,
+                            0x8347db29a7961508,
                         ]),
                         candidate: block_commit_2.clone(),
-                        key: leader_key_2.clone(),
-                        user_burns: vec![user_burn_2.clone(), user_burn_2_2.clone()],
+                        user_burns: vec![],
                     },
                     BurnSamplePoint {
                         burns: (block_commit_3.burn_fee).into(),
                         range_start: Uint256([
-                            0xa224e0451efa00f5,
-                            0xa57394a7b38d5b1c,
-                            0x6bfdbf24cdb0b617,
-                            0xd777aa6d9e769e59,
+                            0x7db29a7961508e12,
+                            0x12c7bbdaf334f834,
+                            0xe1313f5eb2d916ca,
+                            0x8347db29a7961508,
                         ]),
                         range_end: Uint256::max(),
                         candidate: block_commit_3.clone(),
-                        key: leader_key_3.clone(),
                         user_burns: vec![],
                     },
                 ],
@@ -1093,6 +1561,7 @@ mod tests {
 
         for i in 0..fixtures.len() {
             let f = &fixtures[i];
+            eprintln!("Fixture #{}", i);
             let dist = BurnSamplePoint::make_distribution(
                 f.block_commits.iter().cloned().collect(),
                 f.consumed_leader_keys.iter().cloned().collect(),

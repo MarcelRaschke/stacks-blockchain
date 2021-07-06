@@ -3,19 +3,17 @@ extern crate criterion;
 extern crate blockstack_lib;
 extern crate rand;
 
+use blockstack_lib::clarity_vm::database::marf::MarfedKV;
+use blockstack_lib::types::BlockHeaderHash;
 use blockstack_lib::{
-    chainstate::burn::BlockHeaderHash,
-    chainstate::stacks::index::storage::TrieFileStorage,
-    vm::clarity::ClarityInstance,
-    vm::database::{MarfedKV, NULL_HEADER_DB},
-    vm::types::QualifiedContractIdentifier,
+    chainstate::stacks::index::storage::TrieFileStorage, vm::clarity::ClarityInstance,
+    vm::database::NULL_HEADER_DB, vm::types::QualifiedContractIdentifier,
 };
-
 use criterion::Criterion;
 
 pub fn rollback_log_memory_test() {
     let marf = MarfedKV::temporary();
-    let mut clarity_instance = ClarityInstance::new(marf, ExecutionCost::max_value());
+    let mut clarity_instance = ClarityInstance::new(false, marf_kv, ExecutionCost::max_value());
     let EXPLODE_N = 100;
 
     let contract_identifier = QualifiedContractIdentifier::local("foo").unwrap();
@@ -59,7 +57,7 @@ pub fn rollback_log_memory_test() {
 
 pub fn ccall_memory_test() {
     let marf = MarfedKV::temporary();
-    let mut clarity_instance = ClarityInstance::new(marf, ExecutionCost::max_value());
+    let mut clarity_instance = ClarityInstance::new(false, marf_kv, ExecutionCost::max_value());
     let COUNT_PER_CONTRACT = 20;
     let CONTRACTS = 5;
 

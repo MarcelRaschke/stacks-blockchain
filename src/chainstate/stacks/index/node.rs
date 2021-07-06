@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,34 +14,29 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::char::from_digit;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error;
 use std::fmt;
 use std::io;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-
-use sha2::Digest;
-
-use std::char::from_digit;
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
-use chainstate::burn::{BlockHeaderHash, BLOCK_HEADER_HASH_ENCODED_SIZE};
+use sha2::Digest;
 
 use chainstate::stacks::index::bits::{
     get_path_byte_len, get_ptrs_byte_len, path_from_bytes, ptrs_from_bytes, write_path_to_bytes,
 };
-
-use chainstate::stacks::index::{
-    slice_partialeq, BlockMap, MARFValue, MarfTrieId, TrieHash, TrieHasher,
-    MARF_VALUE_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE,
-};
-
 use chainstate::stacks::index::Error;
-
-use net::{codec::read_next, StacksMessageCodec};
+use chainstate::stacks::index::{slice_partialeq, BlockMap, MarfTrieId, TrieHasher};
 use util::hash::to_hex;
 use util::log;
+
+use crate::codec::{read_next, Error as codec_error, StacksMessageCodec};
+use crate::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE;
+use crate::types::chainstate::{BlockHeaderHash, MARFValue, MARF_VALUE_ENCODED_SIZE};
+use crate::types::proof::{ClarityMarfTrieId, TrieHash, TrieLeaf, TRIEHASH_ENCODED_SIZE};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CursorError {
@@ -598,24 +593,6 @@ impl<T: MarfTrieId> TrieCursor<T> {
     }
 }
 
-/// Leaf of a Trie.
-#[derive(Clone)]
-pub struct TrieLeaf {
-    pub path: Vec<u8>,   // path to be lazily expanded
-    pub data: MARFValue, // the actual data
-}
-
-impl fmt::Debug for TrieLeaf {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "TrieLeaf(path={} data={})",
-            &to_hex(&self.path),
-            &to_hex(&self.data.to_vec())
-        )
-    }
-}
-
 impl PartialEq for TrieLeaf {
     fn eq(&self, other: &TrieLeaf) -> bool {
         self.path == other.path && slice_partialeq(self.data.as_bytes(), other.data.as_bytes())
@@ -642,12 +619,12 @@ impl TrieLeaf {
 }
 
 impl StacksMessageCodec for TrieLeaf {
-    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), ::net::Error> {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
         self.path.consensus_serialize(fd)?;
         self.data.consensus_serialize(fd)
     }
 
-    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<TrieLeaf, ::net::Error> {
+    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<TrieLeaf, codec_error> {
         let path = read_next(fd)?;
         let data = read_next(fd)?;
 
@@ -1103,7 +1080,7 @@ impl TrieNode for TrieNode48 {
     }
 
     fn as_trie_node_type(&self) -> TrieNodeType {
-        TrieNodeType::Node48(self.clone())
+        TrieNodeType::Node48(Box::new(self.clone()))
     }
 }
 
@@ -1166,7 +1143,7 @@ impl TrieNode for TrieNode256 {
     }
 
     fn as_trie_node_type(&self) -> TrieNodeType {
-        TrieNodeType::Node256(self.clone())
+        TrieNodeType::Node256(Box::new(self.clone()))
     }
 }
 
@@ -1259,8 +1236,8 @@ impl TrieNode for TrieLeaf {
 pub enum TrieNodeType {
     Node4(TrieNode4),
     Node16(TrieNode16),
-    Node48(TrieNode48),
-    Node256(TrieNode256),
+    Node48(Box<TrieNode48>),
+    Node256(Box<TrieNode256>),
     Leaf(TrieLeaf),
 }
 
@@ -1381,17 +1358,18 @@ impl TrieNodeType {
 mod test {
     #![allow(unused_variables)]
     #![allow(unused_assignments)]
-    use super::*;
-    use std::io::Cursor;
 
-    use chainstate::stacks::index::test::*;
+    use std::io::Cursor;
 
     use chainstate::stacks::index::bits::*;
     use chainstate::stacks::index::marf::*;
     use chainstate::stacks::index::node::*;
     use chainstate::stacks::index::proofs::*;
     use chainstate::stacks::index::storage::*;
+    use chainstate::stacks::index::test::*;
     use chainstate::stacks::index::trie::*;
+
+    use super::*;
 
     #[test]
     fn trieptr_to_bytes() {
@@ -5265,13 +5243,13 @@ mod test {
             .unwrap();
 
         let hash = TrieHash::from_data(&[0u8; 32]);
-        let wres = trie_io.write_nodetype(0, &TrieNodeType::Node48(node48.clone()), hash.clone());
+        let wres = trie_io.write_nodetype(0, &node48.as_trie_node_type(), hash.clone());
         assert!(wres.is_ok());
 
         let rres = trie_io.read_nodetype(&TriePtr::new(TrieNodeID::Node48 as u8, 0, 0));
 
         assert!(rres.is_ok());
-        assert_eq!(rres.unwrap(), (TrieNodeType::Node48(node48.clone()), hash));
+        assert_eq!(rres.unwrap(), (node48.as_trie_node_type(), hash));
     }
 
     #[test]
@@ -5294,7 +5272,7 @@ mod test {
             .extend_to_block(&BlockHeaderHash([0u8; 32]))
             .unwrap();
 
-        let wres = trie_io.write_nodetype(0, &TrieNodeType::Node256(node256.clone()), hash.clone());
+        let wres = trie_io.write_nodetype(0, &node256.as_trie_node_type(), hash.clone());
         assert!(wres.is_ok());
 
         let root_ptr = trie_io.root_ptr();
@@ -5302,10 +5280,7 @@ mod test {
             trie_io.read_nodetype(&TriePtr::new(TrieNodeID::Node256 as u8, 0, root_ptr as u32));
 
         assert!(rres.is_ok());
-        assert_eq!(
-            rres.unwrap(),
-            (TrieNodeType::Node256(node256.clone()), hash)
-        );
+        assert_eq!(rres.unwrap(), (node256.as_trie_node_type(), hash));
     }
 
     #[test]
@@ -5464,7 +5439,8 @@ mod test {
             .unwrap();
 
         let read_child_hashes =
-            Trie::get_children_hashes(&mut trie_io, &TrieNodeType::Node48(node48)).unwrap();
+            Trie::get_children_hashes(&mut trie_io, &TrieNodeType::Node48(Box::new(node48)))
+                .unwrap();
 
         assert_eq!(read_child_hashes, child_hashes);
     }
@@ -5509,7 +5485,8 @@ mod test {
             .unwrap();
 
         let read_child_hashes =
-            Trie::get_children_hashes(&mut trie_io, &TrieNodeType::Node256(node256)).unwrap();
+            Trie::get_children_hashes(&mut trie_io, &TrieNodeType::Node256(Box::new(node256)))
+                .unwrap();
 
         assert_eq!(read_child_hashes, child_hashes);
     }

@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use crate::clarity_vm::database::MemoryBackingStore;
 use vm::analysis::mem_type_check as run_analysis_helper;
 use vm::ast::definition_sorter::DefinitionSorter;
 use vm::ast::errors::ParseErrors;
@@ -21,7 +22,6 @@ use vm::ast::errors::ParseResult;
 use vm::ast::expression_identifier::ExpressionIdentifier;
 use vm::ast::parser;
 use vm::ast::types::{BuildASTPass, ContractAST};
-use vm::database::MemoryBackingStore;
 use vm::types::QualifiedContractIdentifier;
 
 fn run_scoped_parsing_helper(contract: &str) -> ParseResult<ContractAST> {
@@ -41,15 +41,22 @@ fn should_succeed_sorting_contract_call() {
 }
 
 #[test]
+fn should_fix_2123() {
+    let contract = "(define-fungible-token limited-supply-stacks (supply))
+    (define-read-only (supply) u100)";
+    run_analysis_helper(contract).unwrap();
+}
+
+#[test]
 fn should_succeed_sorting_contract_case_1() {
     let contract = r#"
         (define-private (wrapped-kv-del (key int))
             (kv-del key))
         (define-private (kv-del (key int))
             (begin 
-                (map-delete kv-store ((key key)))
+                (map-delete kv-store { key: key })
                 key))
-        (define-map kv-store ((key int)) ((value int)))
+        (define-map kv-store { key: int } { value: int })
     "#;
     run_scoped_parsing_helper(contract).unwrap();
 }
@@ -155,8 +162,8 @@ fn should_raise_dependency_cycle_case_get() {
 fn should_not_raise_dependency_cycle_case_fetch_entry() {
     let contract = r#"
         (define-private (foo (x int)) (begin (bar 1) 1))
-        (define-private (bar (x int)) (map-get? kv-store ((foo 1)))) 
-        (define-map kv-store ((foo int)) ((bar int)))
+        (define-private (bar (x int)) (map-get? kv-store { foo: 1 })) 
+        (define-map kv-store { foo: int } { bar: int })
     "#;
 
     run_scoped_parsing_helper(contract).unwrap();
@@ -167,8 +174,8 @@ fn should_not_raise_dependency_cycle_case_fetch_entry() {
 fn should_raise_dependency_cycle_case_fetch_entry() {
     let contract = r#"
         (define-private (foo (x int)) (+ (bar x) x))
-        (define-private (bar (x int)) (map-get? kv-store ((foo (foo 1))))) 
-        (define-map kv-store ((foo int)) ((bar int)))
+        (define-private (bar (x int)) (map-get? kv-store { foo: (foo 1) })) 
+        (define-map kv-store { foo: int } { bar: int })
     "#;
 
     let err = run_scoped_parsing_helper(contract).unwrap_err();
@@ -183,7 +190,7 @@ fn should_not_raise_dependency_cycle_case_delete_entry() {
     let contract = r#"
         (define-private (foo (x int)) (begin (bar 1) 1))
         (define-private (bar (x int)) (map-delete kv-store (tuple (foo 1)))) 
-        (define-map kv-store ((foo int)) ((bar int)))
+        (define-map kv-store { foo: int } { bar: int })
     "#;
 
     run_scoped_parsing_helper(contract).unwrap();
@@ -195,7 +202,7 @@ fn should_raise_dependency_cycle_case_delete_entry() {
     let contract = r#"
         (define-private (foo (x int)) (+ (bar x) x))
         (define-private (bar (x int)) (map-delete kv-store (tuple (foo (foo 1))))) 
-        (define-map kv-store ((foo int)) ((bar int)))
+        (define-map kv-store { foo: int } { bar: int })
     "#;
 
     let err = run_scoped_parsing_helper(contract).unwrap_err();
@@ -209,8 +216,8 @@ fn should_raise_dependency_cycle_case_delete_entry() {
 fn should_not_raise_dependency_cycle_case_set_entry() {
     let contract = r#"
         (define-private (foo (x int)) (begin (bar 1) 1))
-        (define-private (bar (x int)) (map-set kv-store ((foo 1)) ((bar 3)))) 
-        (define-map kv-store ((foo int)) ((bar int)))
+        (define-private (bar (x int)) (map-set kv-store { foo: 1 } { bar: 3 })) 
+        (define-map kv-store { foo: int } { bar: int })
     "#;
 
     run_scoped_parsing_helper(contract).unwrap();
@@ -221,8 +228,8 @@ fn should_not_raise_dependency_cycle_case_set_entry() {
 fn should_raise_dependency_cycle_case_set_entry() {
     let contract = r#"
         (define-private (foo (x int)) (+ (bar x) x))
-        (define-private (bar (x int)) (map-set kv-store ((foo 1)) ((bar (foo 1))))) 
-        (define-map kv-store ((foo int)) ((bar int)))
+        (define-private (bar (x int)) (map-set kv-store { foo: 1 } { bar: (foo 1) })) 
+        (define-map kv-store { foo: int } { bar: int })
     "#;
 
     let err = run_scoped_parsing_helper(contract).unwrap_err();
@@ -236,8 +243,8 @@ fn should_raise_dependency_cycle_case_set_entry() {
 fn should_not_raise_dependency_cycle_case_insert_entry() {
     let contract = r#"
         (define-private (foo (x int)) (begin (bar 1) 1))
-        (define-private (bar (x int)) (map-insert kv-store ((foo 1)) ((bar 3)))) 
-        (define-map kv-store ((foo int)) ((bar int)))
+        (define-private (bar (x int)) (map-insert kv-store { foo: 1 } { bar: 3 })) 
+        (define-map kv-store { foo: int } { bar: int })
     "#;
 
     run_scoped_parsing_helper(contract).unwrap();
@@ -248,8 +255,8 @@ fn should_not_raise_dependency_cycle_case_insert_entry() {
 fn should_raise_dependency_cycle_case_insert_entry() {
     let contract = r#"
         (define-private (foo (x int)) (+ (bar x) x))
-        (define-private (bar (x int)) (map-insert kv-store ((foo (foo 1))) ((bar 3))))
-        (define-map kv-store ((foo int)) ((bar int)))
+        (define-private (bar (x int)) (map-insert kv-store { foo: (foo 1) } { bar: 3 }))
+        (define-map kv-store { foo: int } { bar: int })
     "#;
 
     let err = run_scoped_parsing_helper(contract).unwrap_err();
@@ -263,7 +270,7 @@ fn should_raise_dependency_cycle_case_insert_entry() {
 fn should_raise_dependency_cycle_case_fetch_contract_entry() {
     let contract = r#"
         (define-private (foo (x int)) (+ (bar x) x))
-        (define-private (bar (x int)) (map-get? kv-store ((foo (foo 1))))) 
+        (define-private (bar (x int)) (map-get? kv-store { foo: (foo 1) })) 
     "#;
 
     let err = run_scoped_parsing_helper(contract).unwrap_err();

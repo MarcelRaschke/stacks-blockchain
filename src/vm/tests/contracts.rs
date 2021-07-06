@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,31 +14,31 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use chainstate::burn::BlockHeaderHash;
+use crate::types::chainstate::BlockHeaderHash;
+use crate::types::chainstate::StacksBlockId;
+use crate::types::proof::ClarityMarfTrieId;
 use chainstate::stacks::index::storage::TrieFileStorage;
-use chainstate::stacks::index::MarfTrieId;
-use chainstate::stacks::StacksBlockId;
+use clarity_vm::clarity::ClarityInstance;
 use util::hash::hex_bytes;
 use vm::ast;
 use vm::ast::errors::ParseErrors;
-use vm::clarity::ClarityInstance;
 use vm::contexts::{Environment, GlobalContext, OwnedEnvironment};
 use vm::contracts::Contract;
 use vm::costs::ExecutionCost;
-use vm::database::{
-    ClarityDatabase, MarfedKV, MemoryBackingStore, NULL_BURN_STATE_DB, NULL_HEADER_DB,
-};
+use vm::database::{ClarityDatabase, NULL_BURN_STATE_DB, NULL_HEADER_DB};
 use vm::errors::{CheckErrors, Error, RuntimeErrorType};
 use vm::execute as vm_execute;
 use vm::representations::SymbolicExpression;
+use vm::tests::{execute, symbols_from_values, with_marfed_environment, with_memory_environment};
 use vm::types::{
     OptionalData, PrincipalData, QualifiedContractIdentifier, ResponseData, StandardPrincipalData,
     TypeSignature, Value,
 };
 
-use vm::tests::{execute, symbols_from_values, with_marfed_environment, with_memory_environment};
+use crate::clarity_vm::database::marf::MarfedKV;
+use crate::clarity_vm::database::MemoryBackingStore;
 
-const FACTORIAL_CONTRACT: &str = "(define-map factorials ((id int)) ((current int) (index int)))
+const FACTORIAL_CONTRACT: &str = "(define-map factorials { id: int } { current: int, index: int })
          (define-private (init-factorial (id int) (factorial int))
            (print (map-insert factorials (tuple (id id)) (tuple (current 1) (index factorial)))))
          (define-public (compute (id int))
@@ -56,7 +56,7 @@ const FACTORIAL_CONTRACT: &str = "(define-map factorials ((id int)) ((current in
         (begin (init-factorial 1337 3)
                (init-factorial 8008 5))";
 
-const SIMPLE_TOKENS: &str = "(define-map tokens ((account principal)) ((balance uint)))
+const SIMPLE_TOKENS: &str = "(define-map tokens { account: principal } { balance: uint })
          (define-read-only (my-get-token-balance (account principal))
             (default-to u0 (get balance (map-get? tokens (tuple (account account))))))
          (define-read-only (explode (account principal))
@@ -89,6 +89,10 @@ const SIMPLE_TOKENS: &str = "(define-map tokens ((account principal)) ((balance 
                 (token-credit! .tokens u4))";
 
 fn get_principal() -> Value {
+    StandardPrincipalData::transient().into()
+}
+
+fn get_principal_as_principal_data() -> PrincipalData {
     StandardPrincipalData::transient().into()
 }
 
@@ -180,7 +184,8 @@ fn test_block_headers(n: u8) -> StacksBlockId {
 
 #[test]
 fn test_simple_token_system() {
-    let mut clarity = ClarityInstance::new(MarfedKV::temporary(), ExecutionCost::max_value());
+    let mut clarity =
+        ClarityInstance::new(false, MarfedKV::temporary(), ExecutionCost::max_value());
     let p1 = PrincipalData::from(
         PrincipalData::parse_standard_principal("SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR")
             .unwrap(),
@@ -192,7 +197,7 @@ fn test_simple_token_system() {
     let contract_identifier = QualifiedContractIdentifier::local("tokens").unwrap();
 
     {
-        let mut block = clarity.begin_block(
+        let mut block = clarity.begin_test_genesis_block(
             &StacksBlockId::sentinel(),
             &test_block_headers(0),
             &NULL_HEADER_DB,
@@ -441,7 +446,7 @@ fn test_contract_caller(owned_env: &mut OwnedEnvironment) {
         let c_b = Value::from(PrincipalData::Contract(
             QualifiedContractIdentifier::local("contract-b").unwrap(),
         ));
-        let mut env = owned_env.get_exec_environment(Some(p1.clone()));
+        let mut env = owned_env.get_exec_environment(Some(p1.clone().expect_principal()));
         assert_eq!(
             env.execute_contract(
                 &QualifiedContractIdentifier::local("contract-a").unwrap(),
@@ -517,7 +522,7 @@ fn test_fully_qualified_contract_call(owned_env: &mut OwnedEnvironment) {
         let c_b = Value::from(PrincipalData::Contract(
             QualifiedContractIdentifier::local("contract-b").unwrap(),
         ));
-        let mut env = owned_env.get_exec_environment(Some(p1.clone()));
+        let mut env = owned_env.get_exec_environment(Some(p1.clone().expect_principal()));
         assert_eq!(
             env.execute_contract(
                 &QualifiedContractIdentifier::local("contract-a").unwrap(),
@@ -569,10 +574,10 @@ fn test_simple_naming_system(owned_env: &mut OwnedEnvironment) {
            (if (< name 100000) u1000 u100))
 
          (define-map name-map
-           ((name int)) ((owner principal)))
+           { name: int } { owner: principal })
          (define-map preorder-map
-           ((name-hash (buff 20)))
-           ((buyer principal) (paid uint)))
+           { name-hash: (buff 20) }
+           { buyer: principal, paid: uint })
 
          (define-public (preorder
                         (name-hash (buff 20))
@@ -638,7 +643,7 @@ fn test_simple_naming_system(owned_env: &mut OwnedEnvironment) {
     }
 
     {
-        let mut env = owned_env.get_exec_environment(Some(p2.clone()));
+        let mut env = owned_env.get_exec_environment(Some(p2.clone().expect_principal()));
 
         assert!(is_err_code(
             &env.execute_contract(
@@ -653,7 +658,7 @@ fn test_simple_naming_system(owned_env: &mut OwnedEnvironment) {
     }
 
     {
-        let mut env = owned_env.get_exec_environment(Some(p1.clone()));
+        let mut env = owned_env.get_exec_environment(Some(p1.clone().expect_principal()));
         assert!(is_committed(
             &env.execute_contract(
                 &QualifiedContractIdentifier::local("names").unwrap(),
@@ -677,7 +682,7 @@ fn test_simple_naming_system(owned_env: &mut OwnedEnvironment) {
 
     {
         // shouldn't be able to register a name you didn't preorder!
-        let mut env = owned_env.get_exec_environment(Some(p2.clone()));
+        let mut env = owned_env.get_exec_environment(Some(p2.clone().expect_principal()));
         assert!(is_err_code(
             &env.execute_contract(
                 &QualifiedContractIdentifier::local("names").unwrap(),
@@ -692,7 +697,7 @@ fn test_simple_naming_system(owned_env: &mut OwnedEnvironment) {
 
     {
         // should work!
-        let mut env = owned_env.get_exec_environment(Some(p1.clone()));
+        let mut env = owned_env.get_exec_environment(Some(p1.clone().expect_principal()));
         assert!(is_committed(
             &env.execute_contract(
                 &QualifiedContractIdentifier::local("names").unwrap(),
@@ -706,7 +711,7 @@ fn test_simple_naming_system(owned_env: &mut OwnedEnvironment) {
 
     {
         // try to underpay!
-        let mut env = owned_env.get_exec_environment(Some(p2.clone()));
+        let mut env = owned_env.get_exec_environment(Some(p2.clone().expect_principal()));
         assert!(is_committed(
             &env.execute_contract(
                 &QualifiedContractIdentifier::local("names").unwrap(),
@@ -767,7 +772,7 @@ fn test_simple_contract_call(owned_env: &mut OwnedEnvironment) {
             (contract-call? .factorial-contract compute 8008))
         ";
 
-    let mut env = owned_env.get_exec_environment(Some(get_principal()));
+    let mut env = owned_env.get_exec_environment(Some(get_principal().expect_principal()));
 
     let contract_identifier = QualifiedContractIdentifier::local("factorial-contract").unwrap();
     env.initialize_contract(contract_identifier, contract_1)
@@ -808,7 +813,7 @@ fn test_simple_contract_call(owned_env: &mut OwnedEnvironment) {
 
 fn test_aborts(owned_env: &mut OwnedEnvironment) {
     let contract_1 = "
-(define-map data ((id int)) ((value int)))
+(define-map data { id: int } { value: int })
 
 ;; this will return false if id != value,
 ;;   which _aborts_ any data that is modified during
@@ -851,7 +856,7 @@ fn test_aborts(owned_env: &mut OwnedEnvironment) {
     env.initialize_contract(contract_identifier, contract_2)
         .unwrap();
 
-    env.sender = Some(get_principal());
+    env.sender = Some(get_principal_as_principal_data());
 
     assert_eq!(
         env.execute_contract(
@@ -982,7 +987,7 @@ fn test_factorial_contract(owned_env: &mut OwnedEnvironment) {
         Value::Int(120),
     ];
 
-    env.sender = Some(get_principal());
+    env.sender = Some(get_principal_as_principal_data());
 
     for (arguments, expectation) in arguments_to_test.iter().zip(expected.iter()) {
         env.execute_contract(

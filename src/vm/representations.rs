@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -34,9 +34,7 @@ macro_rules! guarded_string {
                 if value.len() > (MAX_STRING_LEN as usize) {
                     return Err(RuntimeErrorType::BadNameValue($Label, value));
                 }
-                // TODO: use lazy static ?
-                let regex_check = $Regex.expect("FAIL: Bad static regex.");
-                if regex_check.is_match(&value) {
+                if $Regex.is_match(&value) {
                     Ok(Self(value))
                 } else {
                     Err(RuntimeErrorType::BadNameValue($Label, value))
@@ -78,24 +76,27 @@ macro_rules! guarded_string {
                 Self::try_from(value.to_string()).unwrap()
             }
         }
+
+        impl fmt::Display for $Name {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                self.0.fmt(f)
+            }
+        }
     };
 }
 
-guarded_string!(
-    ClarityName,
-    "ClarityName",
-    Regex::new("^[a-zA-Z]([a-zA-Z0-9]|[-_!?+<>=/*])*$|^[-+=/*]$|^[<>]=?$")
-);
-guarded_string!(
-    ContractName,
-    "ContractName",
-    Regex::new("^[a-zA-Z]([a-zA-Z0-9]|[-_])*$|^__transient$")
-);
-guarded_string!(
-    UrlString,
-    "UrlString",
-    Regex::new(r#"^[a-zA-Z0-9._~:/?#\[\]@!$&'()*+,;%=-]*$"#)
-);
+lazy_static! {
+    pub static ref CLARITY_NAME_REGEX: Regex =
+        Regex::new("^[a-zA-Z]([a-zA-Z0-9]|[-_!?+<>=/*])*$|^[-+=/*]$|^[<>]=?$").unwrap();
+    pub static ref CONTRACT_NAME_REGEX: Regex =
+        Regex::new("^[a-zA-Z]([a-zA-Z0-9]|[-_])*$|^__transient$").unwrap();
+    pub static ref URL_STRING_REGEX: Regex =
+        Regex::new(r#"^[a-zA-Z0-9._~:/?#\[\]@!$&'()*+,;%=-]*$"#).unwrap();
+}
+
+guarded_string!(ClarityName, "ClarityName", CLARITY_NAME_REGEX);
+guarded_string!(ContractName, "ContractName", CONTRACT_NAME_REGEX);
+guarded_string!(UrlString, "UrlString", URL_STRING_REGEX);
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum PreSymbolicExpressionType {

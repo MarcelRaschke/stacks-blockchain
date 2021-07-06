@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -16,7 +16,8 @@
 
 use vm;
 use vm::contexts::{Environment, LocalContext};
-use vm::costs::{cost_functions, CostTracker, MemoryConsumer};
+use vm::costs::cost_functions::ClarityCostFunction;
+use vm::costs::{cost_functions, runtime_cost, CostTracker, MemoryConsumer};
 use vm::errors::{
     check_argument_count, check_arguments_at_least, CheckErrors, InterpreterResult as Result,
     RuntimeErrorType, ShortReturnType,
@@ -195,7 +196,7 @@ pub fn special_match(
 
     let input = vm::eval(&args[0], env, context)?;
 
-    runtime_cost!(cost_functions::MATCH, env, 0)?;
+    runtime_cost(ClarityCostFunction::Match, env, 0)?;
 
     match input {
         Value::Response(data) => special_match_resp(data, &args[1..], env, context),

@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -17,36 +17,31 @@
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 
-use chainstate::burn::db::sortdb::SortitionHandleTx;
-use chainstate::burn::operations::Error as op_error;
-use chainstate::burn::BlockHeaderHash;
-use chainstate::burn::ConsensusHash;
-use chainstate::burn::Opcodes;
-use chainstate::stacks::index::TrieHash;
-
-use chainstate::burn::operations::{
-    parse_u16_from_be, parse_u32_from_be, BlockstackOperation, BlockstackOperationType,
-    LeaderBlockCommitOp, LeaderKeyRegisterOp, UserBurnSupportOp,
-};
-
+use crate::codec::{write_next, Error as codec_error, StacksMessageCodec};
+use crate::types::proof::TrieHash;
 use burnchains::Address;
 use burnchains::Burnchain;
 use burnchains::BurnchainBlockHeader;
-use burnchains::BurnchainHeaderHash;
 use burnchains::BurnchainTransaction;
 use burnchains::PublicKey;
 use burnchains::Txid;
-
-use net::codec::write_next;
+use chainstate::burn::db::sortdb::SortitionHandleTx;
+use chainstate::burn::operations::Error as op_error;
+use chainstate::burn::operations::{
+    parse_u16_from_be, parse_u32_from_be, BlockstackOperationType, LeaderBlockCommitOp,
+    LeaderKeyRegisterOp, UserBurnSupportOp,
+};
+use chainstate::burn::ConsensusHash;
+use chainstate::burn::Opcodes;
 use net::Error as net_error;
-use net::StacksMessageCodec;
-
+use util::db::DBConn;
+use util::db::DBTx;
 use util::hash::Hash160;
 use util::log;
 use util::vrf::{VRFPublicKey, VRF};
 
-use util::db::DBConn;
-use util::db::DBTx;
+use crate::types::chainstate::BlockHeaderHash;
+use crate::types::chainstate::BurnchainHeaderHash;
 
 // return type for parse_data (below)
 struct ParsedData {
@@ -194,35 +189,33 @@ impl StacksMessageCodec for UserBurnSupportOp {
          magic  op consensus hash   proving public key       block hash 160   key blk  key
                 (truncated by 1)                                                        vtxindex
     */
-    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), net_error> {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
         write_next(fd, &(Opcodes::UserBurnSupport as u8))?;
         let truncated_consensus = self.consensus_hash.to_bytes();
         fd.write_all(&truncated_consensus[0..19])
-            .map_err(net_error::WriteError)?;
+            .map_err(codec_error::WriteError)?;
         fd.write_all(&self.public_key.as_bytes()[..])
-            .map_err(net_error::WriteError)?;
+            .map_err(codec_error::WriteError)?;
         write_next(fd, &self.block_header_hash_160)?;
         write_next(fd, &self.key_block_ptr)?;
         write_next(fd, &self.key_vtxindex)?;
         Ok(())
     }
 
-    fn consensus_deserialize<R: Read>(_fd: &mut R) -> Result<UserBurnSupportOp, net_error> {
+    fn consensus_deserialize<R: Read>(_fd: &mut R) -> Result<UserBurnSupportOp, codec_error> {
         // Op deserialized through burchain indexer
         unimplemented!();
     }
 }
 
-impl BlockstackOperation for UserBurnSupportOp {
-    fn from_tx(
-        block_header: &BurnchainBlockHeader,
-        tx: &BurnchainTransaction,
-    ) -> Result<UserBurnSupportOp, op_error> {
-        UserBurnSupportOp::parse_from_tx(block_header.block_height, &block_header.block_hash, tx)
-    }
-}
-
 impl UserBurnSupportOp {
+    pub fn from_tx(
+        _block_header: &BurnchainBlockHeader,
+        _tx: &BurnchainTransaction,
+    ) -> Result<UserBurnSupportOp, op_error> {
+        Err(op_error::UserBurnSupportNotSupported)
+    }
+
     pub fn check(&self, burnchain: &Burnchain, tx: &mut SortitionHandleTx) -> Result<(), op_error> {
         let leader_key_block_height = self.key_block_ptr as u64;
 
@@ -289,30 +282,26 @@ impl UserBurnSupportOp {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::types::chainstate::StacksAddress;
+    use burnchains::bitcoin::address::BitcoinAddress;
     use burnchains::bitcoin::blocks::BitcoinBlockParser;
+    use burnchains::bitcoin::keys::BitcoinPublicKey;
     use burnchains::bitcoin::BitcoinNetworkType;
     use burnchains::*;
-
-    use burnchains::bitcoin::address::BitcoinAddress;
-    use burnchains::bitcoin::keys::BitcoinPublicKey;
-
-    use chainstate::burn::operations::{
-        BlockstackOperation, BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp,
-        UserBurnSupportOp,
-    };
-
     use chainstate::burn::db::sortdb::*;
+    use chainstate::burn::operations::{
+        BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp, UserBurnSupportOp,
+    };
     use chainstate::burn::*;
-
-    use chainstate::stacks::StacksAddress;
-
     use deps::bitcoin::blockdata::transaction::Transaction;
     use deps::bitcoin::network::serialize::deserialize;
-
     use util::get_epoch_time_secs;
     use util::hash::{hex_bytes, to_hex, Hash160};
     use util::log;
+
+    use crate::types::chainstate::SortitionId;
+
+    use super::*;
 
     struct OpFixture {
         txstr: String,
@@ -402,14 +391,18 @@ mod tests {
                 },
                 None => BurnchainBlockHeader {
                     block_height: 0,
-                    block_hash: BurnchainHeaderHash([0u8; 32]),
-                    parent_block_hash: BurnchainHeaderHash([0u8; 32]),
+                    block_hash: BurnchainHeaderHash::zero(),
+                    parent_block_hash: BurnchainHeaderHash::zero(),
                     num_txs: 0,
                     timestamp: get_epoch_time_secs(),
                 },
             };
 
-            let op = UserBurnSupportOp::from_tx(&header, &burnchain_tx);
+            let op = UserBurnSupportOp::parse_from_tx(
+                header.block_height,
+                &header.block_hash,
+                &burnchain_tx,
+            );
 
             match (op, tx_fixture.result) {
                 (Ok(parsed_tx), Some(result)) => {
@@ -509,7 +502,9 @@ mod tests {
             working_dir: "/nope".to_string(),
             consensus_hash_lifetime: 24,
             stable_confirmations: 7,
-            first_block_height: first_block_height,
+            first_block_height,
+            initial_reward_start_block: first_block_height,
+            first_block_timestamp: 0,
             first_block_hash: first_burn_hash.clone(),
         };
 
@@ -574,11 +569,13 @@ mod tests {
             let mut prev_snapshot = SortitionDB::get_first_block_snapshot(db.conn()).unwrap();
             for i in 0..10 {
                 let mut snapshot_row = BlockSnapshot {
+                    accumulated_coinbase_ustx: 0,
                     pox_valid: true,
                     block_height: i + 1 + first_block_height,
                     burn_header_timestamp: get_epoch_time_secs(),
                     burn_header_hash: block_header_hashes[i as usize].clone(),
                     sortition_id: SortitionId(block_header_hashes[i as usize].0.clone()),
+                    parent_sortition_id: prev_snapshot.sortition_id.clone(),
                     parent_burn_header_hash: prev_snapshot.burn_header_hash.clone(),
                     consensus_hash: ConsensusHash::from_bytes(&[
                         0,
@@ -636,6 +633,8 @@ mod tests {
                         &prev_snapshot,
                         &snapshot_row,
                         &block_ops[i as usize],
+                        &vec![],
+                        None,
                         None,
                         None,
                     )

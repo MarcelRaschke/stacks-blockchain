@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -61,7 +61,7 @@ use core::NETWORK_P2P_PORT;
 
 use util::strings::UrlString;
 
-pub const PEERDB_VERSION: &'static str = "23.0.0.0";
+pub const PEERDB_VERSION: &'static str = "1";
 
 const NUM_SLOTS: usize = 8;
 
@@ -73,7 +73,7 @@ impl PeerAddress {
 
 impl FromColumn<PeerAddress> for PeerAddress {
     fn from_column<'a>(row: &'a Row, column_name: &str) -> Result<PeerAddress, db_error> {
-        let addrbytes_bin: String = row.get(column_name);
+        let addrbytes_bin: String = row.get_unwrap(column_name);
         if addrbytes_bin.len() != 128 {
             error!("Unparsable peer address {}", addrbytes_bin);
             return Err(db_error::ParseError);
@@ -163,7 +163,7 @@ impl LocalPeer {
         let services = ServiceFlags::RELAY;
 
         info!(
-            "Peer's public key: {}",
+            "Will be authenticating p2p messages with public key: {}",
             Secp256k1PublicKey::from_private(&pkey).to_hex()
         );
 
@@ -194,15 +194,15 @@ impl LocalPeer {
 
 impl FromRow<LocalPeer> for LocalPeer {
     fn from_row<'a>(row: &'a Row) -> Result<LocalPeer, db_error> {
-        let network_id: u32 = row.get("network_id");
-        let parent_network_id: u32 = row.get("parent_network_id");
-        let nonce_hex: String = row.get("nonce");
+        let network_id: u32 = row.get_unwrap("network_id");
+        let parent_network_id: u32 = row.get_unwrap("parent_network_id");
+        let nonce_hex: String = row.get_unwrap("nonce");
         let privkey = Secp256k1PrivateKey::from_column(row, "private_key")?;
         let privkey_expire = u64::from_column(row, "private_key_expire")?;
         let addrbytes: PeerAddress = PeerAddress::from_column(row, "addrbytes")?;
-        let port: u16 = row.get("port");
-        let services: u16 = row.get("services");
-        let data_url_str: String = row.get("data_url");
+        let port: u16 = row.get_unwrap("port");
+        let services: u16 = row.get_unwrap("services");
+        let data_url_str: String = row.get_unwrap("data_url");
 
         let nonce_bytes = hex_bytes(&nonce_hex).map_err(|_e| {
             error!("Unparseable local peer nonce {}", &nonce_hex);
@@ -236,10 +236,10 @@ impl FromRow<LocalPeer> for LocalPeer {
 
 impl FromRow<ASEntry4> for ASEntry4 {
     fn from_row<'a>(row: &'a Row) -> Result<ASEntry4, db_error> {
-        let prefix: u32 = row.get("prefix");
-        let mask: u8 = row.get("mask");
-        let asn: u32 = row.get("asn");
-        let org: u32 = row.get("org");
+        let prefix: u32 = row.get_unwrap("prefix");
+        let mask: u8 = row.get_unwrap("mask");
+        let asn: u32 = row.get_unwrap("asn");
+        let org: u32 = row.get_unwrap("org");
 
         Ok(ASEntry4 {
             prefix,
@@ -252,20 +252,20 @@ impl FromRow<ASEntry4> for ASEntry4 {
 
 impl FromRow<Neighbor> for Neighbor {
     fn from_row<'a>(row: &'a Row) -> Result<Neighbor, db_error> {
-        let peer_version: u32 = row.get("peer_version");
-        let network_id: u32 = row.get("network_id");
+        let peer_version: u32 = row.get_unwrap("peer_version");
+        let network_id: u32 = row.get_unwrap("network_id");
         let addrbytes: PeerAddress = PeerAddress::from_column(row, "addrbytes")?;
-        let port: u16 = row.get("port");
+        let port: u16 = row.get_unwrap("port");
         let mut public_key: Secp256k1PublicKey =
             Secp256k1PublicKey::from_column(row, "public_key")?;
         let expire_block_height = u64::from_column(row, "expire_block_height")?;
         let last_contact_time = u64::from_column(row, "last_contact_time")?;
-        let asn: u32 = row.get("asn");
-        let org: u32 = row.get("org");
-        let allowed: i64 = row.get("allowed");
-        let denied: i64 = row.get("denied");
-        let in_degree: u32 = row.get("in_degree");
-        let out_degree: u32 = row.get("out_degree");
+        let asn: u32 = row.get_unwrap("asn");
+        let org: u32 = row.get_unwrap("org");
+        let allowed: i64 = row.get_unwrap("allowed");
+        let denied: i64 = row.get_unwrap("denied");
+        let in_degree: u32 = row.get_unwrap("in_degree");
+        let out_degree: u32 = row.get_unwrap("out_degree");
 
         public_key.set_compressed(true);
 
@@ -297,7 +297,8 @@ impl FromRow<Neighbor> for Neighbor {
 // it is still online, the new peer will _not_ be inserted.  If it is offline, then it will be.
 // This is done to ensure that the frontier represents live, long-lived peers to the greatest
 // extent possible.
-const PEERDB_SETUP: &'static [&'static str] = &[
+
+const PEERDB_INITIAL_SCHEMA: &'static [&'static str] = &[
     r#"
     CREATE TABLE frontier(
         peer_version INTEGER NOT NULL,
@@ -320,9 +321,7 @@ const PEERDB_SETUP: &'static [&'static str] = &[
 
         PRIMARY KEY(slot)
     );"#,
-    r#"
-    CREATE INDEX peer_address_index ON frontier(network_id,addrbytes,port);
-    "#,
+    "CREATE INDEX peer_address_index ON frontier(network_id,addrbytes,port);",
     r#"
     CREATE TABLE asn4(
         prefix INTEGER NOT NULL,
@@ -333,9 +332,7 @@ const PEERDB_SETUP: &'static [&'static str] = &[
 
         PRIMARY KEY(prefix,mask)
     );"#,
-    r#"
-    CREATE TABLE db_version(version TEXT NOT NULL);
-    "#,
+    "CREATE TABLE db_config(version TEXT NOT NULL);",
     r#"
     CREATE TABLE local_peer(
         network_id INT NOT NULL,
@@ -360,6 +357,7 @@ const PEERDB_SETUP: &'static [&'static str] = &[
     );"#,
 ];
 
+#[derive(Debug)]
 pub struct PeerDB {
     pub conn: Connection,
     pub readwrite: bool,
@@ -390,13 +388,12 @@ impl PeerDB {
 
         let mut tx = self.tx_begin()?;
 
-        for row_text in PEERDB_SETUP {
-            tx.execute(row_text, NO_PARAMS)
-                .map_err(db_error::SqliteError)?;
+        for row_text in PEERDB_INITIAL_SCHEMA {
+            tx.execute_batch(row_text).map_err(db_error::SqliteError)?;
         }
 
         tx.execute(
-            "INSERT INTO db_version (version) VALUES (?1)",
+            "INSERT INTO db_config (version) VALUES (?1)",
             &[&PEERDB_VERSION],
         )
         .map_err(db_error::SqliteError)?;
@@ -818,6 +815,36 @@ impl PeerDB {
         }
     }
 
+    /// Is a peer always allowed?
+    pub fn is_peer_always_allowed(
+        conn: &DBConn,
+        network_id: u32,
+        peer_addr: &PeerAddress,
+        peer_port: u16,
+    ) -> Result<bool, db_error> {
+        match PeerDB::get_peer(conn, network_id, peer_addr, peer_port)? {
+            Some(neighbor) => {
+                if neighbor.allowed < 0 {
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+            None => {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Get all always-allowed peers
+    pub fn get_always_allowed_peers(
+        conn: &DBConn,
+        network_id: u32,
+    ) -> Result<Vec<Neighbor>, db_error> {
+        let sql = "SELECT * FROM frontier WHERE allowed < 0 AND network_id = ?1 ORDER BY RANDOM()";
+        let allow_rows = query_rows::<Neighbor, _>(conn, sql, &[&network_id])?;
+        Ok(allow_rows)
+    }
+
     /// Insert or replace a neighbor into a given slot
     pub fn insert_or_replace_peer<'a>(
         tx: &mut Transaction<'a>,
@@ -1104,7 +1131,7 @@ impl PeerDB {
         let rows_res_iter = stmt
             .query_and_then(NO_PARAMS, |row| {
                 let prefix = PeerAddress::from_column(row, "prefix")?;
-                let mask: u32 = row.get("mask");
+                let mask: u32 = row.get_unwrap("mask");
                 let res: Result<(PeerAddress, u32), db_error> = Ok((prefix, mask));
                 res
             })
@@ -1312,7 +1339,7 @@ impl PeerDB {
 
         let qry = "SELECT * FROM asn4 WHERE prefix = (?1 & ~((1 << (32 - mask)) - 1)) ORDER BY prefix DESC LIMIT 1".to_string();
         let args = [&addr_u32 as &dyn ToSql];
-        let rows = query_rows::<ASEntry4, _>(conn, &qry.to_string(), &args)?;
+        let rows = query_rows::<ASEntry4, _>(conn, &qry, &args)?;
         match rows.len() {
             0 => Ok(None),
             _ => Ok(Some(rows[0].asn)),

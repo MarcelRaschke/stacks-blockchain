@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -23,24 +23,20 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use sha2::Digest;
 use sha2::Sha512Trunc256 as TrieHasher;
 
-use chainstate::stacks::index::{BlockMap, MarfTrieId, TrieHash, TRIEHASH_ENCODED_SIZE};
-
 use chainstate::stacks::index::node::{
-    clear_backptr, ConsensusSerializable, TrieLeaf, TrieNode16, TrieNode256, TrieNode4, TrieNode48,
+    clear_backptr, ConsensusSerializable, TrieNode16, TrieNode256, TrieNode4, TrieNode48,
     TrieNodeID, TrieNodeType, TriePtr, TRIEPTR_SIZE,
 };
-
-use chainstate::stacks::index::storage::{fseek, ftell, TrieFileStorage, TrieStorageConnection};
-
 use chainstate::stacks::index::node::{TrieNode, TRIEPATH_MAX_LEN};
-
+use chainstate::stacks::index::storage::{fseek, ftell, TrieFileStorage, TrieStorageConnection};
 use chainstate::stacks::index::Error;
-
-use chainstate::burn::BLOCK_HEADER_HASH_ENCODED_SIZE;
-
+use chainstate::stacks::index::{BlockMap, MarfTrieId};
 use util::hash::to_hex;
 use util::log;
 use util::macros::is_trace;
+
+use crate::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE;
+use crate::types::proof::{TrieHash, TrieLeaf, TRIEHASH_ENCODED_SIZE};
 
 /// Get the size of a Trie path (note that a Trie path is 32 bytes long, and can definitely _not_
 /// be over 255 bytes).
@@ -228,8 +224,8 @@ pub fn get_nodetype_hash_bytes<T: MarfTrieId, M: BlockMap>(
     match node {
         TrieNodeType::Node4(ref data) => get_node_hash(data, child_hash_bytes, map),
         TrieNodeType::Node16(ref data) => get_node_hash(data, child_hash_bytes, map),
-        TrieNodeType::Node48(ref data) => get_node_hash(data, child_hash_bytes, map),
-        TrieNodeType::Node256(ref data) => get_node_hash(data, child_hash_bytes, map),
+        TrieNodeType::Node48(ref data) => get_node_hash(data.as_ref(), child_hash_bytes, map),
+        TrieNodeType::Node256(ref data) => get_node_hash(data.as_ref(), child_hash_bytes, map),
         TrieNodeType::Leaf(ref data) => get_node_hash(data, child_hash_bytes, map),
     }
 }
@@ -333,11 +329,11 @@ pub fn read_nodetype_at_head<F: Read>(
         }
         TrieNodeID::Node48 => {
             let node = TrieNode48::from_bytes(f)?;
-            TrieNodeType::Node48(node)
+            TrieNodeType::Node48(Box::new(node))
         }
         TrieNodeID::Node256 => {
             let node = TrieNode256::from_bytes(f)?;
-            TrieNodeType::Node256(node)
+            TrieNodeType::Node256(Box::new(node))
         }
         TrieNodeID::Leaf => {
             let node = TrieLeaf::from_bytes(f)?;

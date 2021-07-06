@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -21,15 +21,28 @@
 
 extern crate blockstack_lib;
 
+use std::convert::TryFrom;
+use std::io::prelude::*;
+use std::io::Read;
+use std::{env, fs, io};
+
+use blockstack_lib::address::b58;
 use blockstack_lib::address::AddressHashMode;
+use blockstack_lib::burnchains::bitcoin::address::{
+    ADDRESS_VERSION_MAINNET_SINGLESIG, ADDRESS_VERSION_TESTNET_SINGLESIG,
+};
 use blockstack_lib::burnchains::Address;
 use blockstack_lib::chainstate::stacks::{
-    StacksAddress, StacksBlock, StacksPrivateKey, StacksPublicKey, StacksTransaction,
-    StacksTransactionSigner, TokenTransferMemo, TransactionAuth, TransactionContractCall,
-    TransactionPayload, TransactionSmartContract, TransactionSpendingCondition, TransactionVersion,
-    C32_ADDRESS_VERSION_MAINNET_SINGLESIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
+    StacksBlock, StacksMicroblock, StacksPrivateKey, StacksPublicKey, StacksTransaction,
+    StacksTransactionSigner, TokenTransferMemo, TransactionAnchorMode, TransactionAuth,
+    TransactionContractCall, TransactionPayload, TransactionSmartContract,
+    TransactionSpendingCondition, TransactionVersion, C32_ADDRESS_VERSION_MAINNET_SINGLESIG,
+    C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
 };
-use blockstack_lib::net::{Error as NetError, StacksMessageCodec};
+use blockstack_lib::codec::{Error as CodecError, StacksMessageCodec};
+use blockstack_lib::core::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
+use blockstack_lib::net::Error as NetError;
+use blockstack_lib::types::chainstate::StacksAddress;
 use blockstack_lib::util::{
     hash::hex_bytes, hash::to_hex, log, retry::LogReader, strings::StacksString,
 };
@@ -39,18 +52,6 @@ use blockstack_lib::vm::{
     types::PrincipalData,
     ClarityName, ContractName, Value,
 };
-use std::convert::TryFrom;
-use std::io::prelude::*;
-use std::io::Read;
-use std::{env, fs, io};
-
-use blockstack_lib::address::b58;
-use blockstack_lib::burnchains::bitcoin::address::{
-    ADDRESS_VERSION_MAINNET_SINGLESIG, ADDRESS_VERSION_TESTNET_SINGLESIG,
-};
-
-const TESTNET_CHAIN_ID: u32 = 0x80000000;
-const MAINNET_CHAIN_ID: u32 = 0x00000001;
 
 const USAGE: &str = "blockstack-cli (options) [method] [args...]
 
@@ -59,11 +60,14 @@ to process.
 
 This CLI has these methods:
 
-  publish          used to generate and sign a contract publish transaction
-  contract-call    used to generate and sign a contract-call transaction
-  generate-sk      used to generate a secret key for transaction signing
-  token-transfer   used to generate and sign a transfer transaction
-  addresses        used to get both Bitcoin and Stacks addresses from a private key
+  publish            used to generate and sign a contract publish transaction
+  contract-call      used to generate and sign a contract-call transaction
+  generate-sk        used to generate a secret key for transaction signing
+  token-transfer     used to generate and sign a transfer transaction
+  addresses          used to get both Bitcoin and Stacks addresses from a private key
+  decode-tx          used to decode a hex-encoded transaction into a human-readable representation
+  decode-block       used to decode a hex-encoded Stacks block into a human-readable representation
+  decode-microblock  used to decode a hex-encoded Stacks microblock into a human-readable representation
 
 For usage information on those methods, call `blockstack-cli [method] -h`
 
@@ -77,13 +81,26 @@ const PUBLISH_USAGE: &str = "blockstack-cli (options) publish [publisher-secret-
 
 The publish command generates and signs a contract publish transaction. If successful,
 this command outputs the hex string encoding of the transaction to stdout, and exits with
-code 0";
+code 0
+
+A smart contract can be mined in a Stacks block, a Stacks microblock, or either.  The default
+is that the miner chooses, but you can decide which with the following options:
+
+  --microblock-only  indicates to mine this transaction only in a microblock
+  --block-only       indicates to mine this transaction only in a block
+";
 
 const CALL_USAGE: &str = "blockstack-cli (options) contract-call [origin-secret-key-hex] [fee-rate] [nonce] [contract-publisher-address] [contract-name] [function-name] [args...]
 
 The contract-call command generates and signs a contract-call transaction. If successful,
 this command outputs the hex string encoding of the transaction to stdout, and exits with
-code 0
+code 0.
+
+A contract-call can be mined in a Stacks block, a Stacks microblock, or either.  The default
+is that the miner chooses, but you can decide which with the following options:
+
+  --microblock-only  indicates to mine this transaction only in a microblock
+  --block-only       indicates to mine this transaction only in a block
 
 Arguments are supplied in one of two ways: through script evaluation or via hex encoding
 of the value serialization format. The method for supplying arguments is chosen by
@@ -105,7 +122,14 @@ const TOKEN_TRANSFER_USAGE: &str = "blockstack-cli (options) token-transfer [ori
 
 The transfer command generates and signs a STX transfer transaction. If successful,
 this command outputs the hex string encoding of the transaction to stdout, and exits with
-code 0";
+code 0
+
+A token-transfer can be mined in a Stacks block, a Stacks microblock, or either.  The default
+is that the miner chooses, but you can decide which with the following options:
+
+  --microblock-only  indicates to mine this transaction only in a microblock
+  --block-only       indicates to mine this transaction only in a block
+";
 
 const GENERATE_USAGE: &str = "blockstack-cli (options) generate-sk
 
@@ -116,20 +140,29 @@ const ADDRESSES_USAGE: &str = "blockstack-cli (options) addresses [secret-key-he
 
 The addresses command calculates both the Bitcoin and Stacks addresses from a secret key.
 If successful, this command outputs both the Bitcoin and Stacks addresses to stdout, formatted
-as JSON, and exits with code 0";
+as JSON, and exits with code 0.";
 
 const DECODE_TRANSACTION_USAGE: &str =
     "blockstack-cli (options) decode-tx [transaction-hex-or-stdin]
 
 The decode-tx command decodes a serialized Stacks transaction and prints it to stdout as JSON.
 The transaction, if given, must be a hex string.  Alternatively, you may pass - instead, and the
-raw binary transaction will be read from stdin";
+raw binary transaction will be read from stdin.";
 
 const DECODE_BLOCK_USAGE: &str = "blockstack-cli (options) decode-block [block-path-or-stdin]
 
-The decode-tx command decodes a serialized Stacks block and prints it to stdout as JSON.
+The decode-block command decodes a serialized Stacks block and prints it to stdout as JSON.
 The block, if given, must be a hex string.  Alternatively, you may pass - instead, and the
-raw binary block will be read from stdin";
+raw binary block will be read from stdin.";
+
+const DECODE_MICROBLOCK_USAGE: &str = "blockstack-cli (options) decode-microblock [microblock-path-or-stdin]
+
+The decode-microblock command decodes a serialized Stacks microblock and prints it to stdout as JSON.
+The microblock, if given, must be a hex string.  Alternatively, you may pass - instead, and the
+raw binary microblock will be read from stdin.
+
+N.B. Stacks microblocks are not stored as files in the Stacks chainstate -- they are stored in 
+block's sqlite database.";
 
 #[derive(Debug)]
 enum CliError {
@@ -181,6 +214,12 @@ impl From<ClarityError> for CliError {
 impl From<NetError> for CliError {
     fn from(value: NetError) -> Self {
         CliError::Message(format!("Stacks NetError: {}", value))
+    }
+}
+
+impl From<CodecError> for CliError {
+    fn from(value: CodecError) -> Self {
+        CliError::Message(format!("Stacks CodecError: {}", value))
     }
 }
 
@@ -243,13 +282,13 @@ fn make_standard_single_sig_tx(
     payload: TransactionPayload,
     publicKey: &StacksPublicKey,
     nonce: u64,
-    fee_rate: u64,
+    tx_fee: u64,
 ) -> StacksTransaction {
     let mut spending_condition =
         TransactionSpendingCondition::new_singlesig_p2pkh(publicKey.clone())
             .expect("Failed to create p2pkh spending condition from public key.");
     spending_condition.set_nonce(nonce);
-    spending_condition.set_fee_rate(fee_rate);
+    spending_condition.set_tx_fee(tx_fee);
     let auth = TransactionAuth::Standard(spending_condition);
     let mut tx = StacksTransaction::new(version, auth, payload);
     tx.chain_id = chain_id;
@@ -271,11 +310,51 @@ fn sign_transaction_single_sig_standard(
         .ok_or("TX did not finish signing -- was this a standard single signature transaction?")?)
 }
 
+fn parse_anchor_mode(
+    args: &mut Vec<String>,
+    usage: &str,
+) -> Result<TransactionAnchorMode, CliError> {
+    let num_args = args.len();
+    let mut offchain_only = false;
+    let mut onchain_only = false;
+    let mut idx = 0;
+    for i in 0..num_args {
+        if args[i] == "--microblock-only" {
+            if idx > 0 {
+                return Err(CliError::Message(format!("USAGE:\n {}", usage,)));
+            }
+
+            offchain_only = true;
+            idx = i;
+        }
+        if args[i] == "--block-only" {
+            if idx > 0 {
+                return Err(CliError::Message(format!("USAGE:\n {}", usage,)));
+            }
+
+            onchain_only = true;
+            idx = i;
+        }
+    }
+    if idx > 0 {
+        args.remove(idx);
+    }
+    if onchain_only {
+        Ok(TransactionAnchorMode::OnChainOnly)
+    } else if offchain_only {
+        Ok(TransactionAnchorMode::OffChainOnly)
+    } else {
+        Ok(TransactionAnchorMode::Any)
+    }
+}
+
 fn handle_contract_publish(
-    args: &[String],
+    args_slice: &[String],
     version: TransactionVersion,
     chain_id: u32,
 ) -> Result<String, CliError> {
+    let mut args = args_slice.to_vec();
+
     if args.len() >= 1 && args[0] == "-h" {
         return Err(CliError::Message(format!("USAGE:\n {}", PUBLISH_USAGE)));
     }
@@ -285,8 +364,9 @@ fn handle_contract_publish(
             PUBLISH_USAGE
         )));
     }
+    let anchor_mode = parse_anchor_mode(&mut args, PUBLISH_USAGE)?;
     let sk_publisher = &args[0];
-    let fee_rate = args[1].parse()?;
+    let tx_fee = args[1].parse()?;
     let nonce = args[2].parse()?;
     let contract_name = &args[3];
     let contract_file = &args[4];
@@ -302,14 +382,16 @@ fn handle_contract_publish(
     let sk_publisher = StacksPrivateKey::from_hex(sk_publisher)?;
 
     let payload = make_contract_publish(contract_name.clone(), contract_contents)?;
-    let unsigned_tx = make_standard_single_sig_tx(
+    let mut unsigned_tx = make_standard_single_sig_tx(
         version,
         chain_id,
         payload.into(),
         &StacksPublicKey::from_private(&sk_publisher),
         nonce,
-        fee_rate,
+        tx_fee,
     );
+    unsigned_tx.anchor_mode = anchor_mode;
+
     let mut unsigned_tx_bytes = vec![];
     unsigned_tx
         .consensus_serialize(&mut unsigned_tx_bytes)
@@ -325,10 +407,11 @@ fn handle_contract_publish(
 }
 
 fn handle_contract_call(
-    args: &[String],
+    args_slice: &[String],
     version: TransactionVersion,
     chain_id: u32,
 ) -> Result<String, CliError> {
+    let mut args = args_slice.to_vec();
     if args.len() >= 1 && args[0] == "-h" {
         return Err(CliError::Message(format!("USAGE:\n {}", CALL_USAGE)));
     }
@@ -338,8 +421,9 @@ fn handle_contract_call(
             CALL_USAGE
         )));
     }
+    let anchor_mode = parse_anchor_mode(&mut args, CALL_USAGE)?;
     let sk_origin = &args[0];
-    let fee_rate = args[1].parse()?;
+    let tx_fee = args[1].parse()?;
     let nonce = args[2].parse()?;
     let contract_address = &args[3];
     let contract_name = &args[4];
@@ -384,14 +468,15 @@ fn handle_contract_call(
         function_name.clone(),
         values,
     )?;
-    let unsigned_tx = make_standard_single_sig_tx(
+    let mut unsigned_tx = make_standard_single_sig_tx(
         version,
         chain_id,
         payload.into(),
         &StacksPublicKey::from_private(&sk_origin),
         nonce,
-        fee_rate,
+        tx_fee,
     );
+    unsigned_tx.anchor_mode = anchor_mode;
 
     let mut unsigned_tx_bytes = vec![];
     unsigned_tx
@@ -407,10 +492,11 @@ fn handle_contract_call(
 }
 
 fn handle_token_transfer(
-    args: &[String],
+    args_slice: &[String],
     version: TransactionVersion,
     chain_id: u32,
 ) -> Result<String, CliError> {
+    let mut args = args_slice.to_vec();
     if args.len() >= 1 && args[0] == "-h" {
         return Err(CliError::Message(format!(
             "USAGE:\n {}",
@@ -423,8 +509,10 @@ fn handle_token_transfer(
             TOKEN_TRANSFER_USAGE
         )));
     }
+
+    let anchor_mode = parse_anchor_mode(&mut args, TOKEN_TRANSFER_USAGE)?;
     let sk_origin = StacksPrivateKey::from_hex(&args[0])?;
-    let fee_rate = args[1].parse()?;
+    let tx_fee = args[1].parse()?;
     let nonce = args[2].parse()?;
     let recipient_address =
         PrincipalData::parse(&args[3]).map_err(|_e| "Failed to parse recipient")?;
@@ -442,14 +530,16 @@ fn handle_token_transfer(
     };
 
     let payload = TransactionPayload::TokenTransfer(recipient_address, *amount, memo);
-    let unsigned_tx = make_standard_single_sig_tx(
+    let mut unsigned_tx = make_standard_single_sig_tx(
         version,
         chain_id,
         payload,
         &StacksPublicKey::from_private(&sk_origin),
         nonce,
-        fee_rate,
+        tx_fee,
     );
+    unsigned_tx.anchor_mode = anchor_mode;
+
     let mut unsigned_tx_bytes = vec![];
     unsigned_tx
         .consensus_serialize(&mut unsigned_tx_bytes)
@@ -608,6 +698,45 @@ fn decode_block(args: &[String], _version: TransactionVersion) -> Result<String,
     }
 }
 
+fn decode_microblock(args: &[String], _version: TransactionVersion) -> Result<String, CliError> {
+    if (args.len() >= 1 && args[0] == "-h") || args.len() != 1 {
+        return Err(CliError::Message(format!(
+            "Usage: {}\n",
+            DECODE_MICROBLOCK_USAGE
+        )));
+    }
+    let mblock_data = if args[0] == "-" {
+        // read from stdin
+        let mut block_str = Vec::new();
+        io::stdin()
+            .read_to_end(&mut block_str)
+            .expect("Failed to read block from stdin");
+        block_str
+    } else {
+        // given as a command-line arg
+        hex_bytes(&args[0].clone()).expect("Failed to decode microblock: must be a hex string")
+    };
+
+    let mut cursor = io::Cursor::new(&mblock_data);
+    let mut debug_cursor = LogReader::from_reader(&mut cursor);
+
+    match StacksMicroblock::consensus_deserialize(&mut debug_cursor) {
+        Ok(block) => {
+            Ok(serde_json::to_string(&block).expect("Failed to serialize microblock to JSON"))
+        }
+        Err(e) => {
+            let mut ret = String::new();
+            ret.push_str(&format!("Failed to decode microblock: {:?}\n", &e));
+            ret.push_str("Bytes consumed:\n");
+            for buf in debug_cursor.log().iter() {
+                ret.push_str(&format!("   {}", to_hex(buf)));
+            }
+            ret.push_str("\n");
+            Ok(ret)
+        }
+    }
+}
+
 fn main() {
     let mut argv: Vec<String> = env::args().collect();
 
@@ -633,9 +762,9 @@ fn main_handler(mut argv: Vec<String>) -> Result<String, CliError> {
     };
 
     let chain_id = if tx_version == TransactionVersion::Testnet {
-        TESTNET_CHAIN_ID
+        CHAIN_ID_TESTNET
     } else {
-        MAINNET_CHAIN_ID
+        CHAIN_ID_MAINNET
     };
 
     if let Some((method, args)) = argv.split_first() {
@@ -647,6 +776,7 @@ fn main_handler(mut argv: Vec<String>) -> Result<String, CliError> {
             "addresses" => get_addresses(args, tx_version),
             "decode-tx" => decode_transaction(args, tx_version),
             "decode-block" => decode_block(args, tx_version),
+            "decode-microblock" => decode_microblock(args, tx_version),
             _ => Err(CliError::Usage),
         }
     } else {
@@ -657,6 +787,7 @@ fn main_handler(mut argv: Vec<String>) -> Result<String, CliError> {
 #[cfg(test)]
 mod test {
     use super::*;
+
     #[test]
     fn generate_should_work() {
         assert!(main_handler(vec!["generate-sk".into(), "--testnet".into()]).is_ok());
@@ -714,6 +845,30 @@ mod test {
             "token-transfer",
             "043ff5004e3d695060fa48ac94c96049b8c14ef441c50a184a6a3875d2a000f3",
             "1",
+            "--block-only",
+            "0",
+            "ST1A14RBKJ289E3DP89QAZE2RRHDPWP5RHMYFRCHV",
+            "10",
+        ];
+
+        assert!(main_handler(to_string_vec(&tt_args)).is_ok());
+
+        let tt_args = [
+            "token-transfer",
+            "043ff5004e3d695060fa48ac94c96049b8c14ef441c50a184a6a3875d2a000f3",
+            "1",
+            "--microblock-only",
+            "0",
+            "ST1A14RBKJ289E3DP89QAZE2RRHDPWP5RHMYFRCHV",
+            "10",
+        ];
+
+        assert!(main_handler(to_string_vec(&tt_args)).is_ok());
+
+        let tt_args = [
+            "token-transfer",
+            "043ff5004e3d695060fa48ac94c96049b8c14ef441c50a184a6a3875d2a000f3",
+            "1",
             "0",
             "ST1A14RBKJ289E3DP89QAZE2RRHDPWP5RHMYFRCHV",
             "10",
@@ -749,6 +904,19 @@ mod test {
             format!("{}", main_handler(to_string_vec(&tt_args)).unwrap_err())
                 .contains("Failed to parse recipient")
         );
+
+        let tt_args = [
+            "token-transfer",
+            "043ff5004e3d695060fa48ac94c96049b8c14ef441c50a184a6a3875d2a000f3",
+            "1",
+            "0",
+            "SX1A14RBKJ289E3DP89QAZE2RRHDPWP5RHMYFRCHV",
+            "10",
+            "--microblock-only",
+            "--block-only",
+        ];
+
+        assert!(main_handler(to_string_vec(&tt_args)).is_err());
     }
 
     #[test]

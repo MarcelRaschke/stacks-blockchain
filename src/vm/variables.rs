@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -19,6 +19,9 @@ use vm::contexts::{Environment, LocalContext};
 use vm::errors::{InterpreterResult as Result, RuntimeErrorType};
 use vm::types::BuffData;
 use vm::types::Value;
+
+use vm::costs::cost_functions::ClarityCostFunction;
+use vm::costs::runtime_cost;
 
 define_named_enum!(NativeVariables {
     ContractCaller("contract-caller"), TxSender("tx-sender"), BlockHeight("block-height"),
@@ -44,20 +47,22 @@ pub fn lookup_reserved_variable(
                     .sender
                     .clone()
                     .ok_or(RuntimeErrorType::NoSenderInContext)?;
-                Ok(Some(sender))
+                Ok(Some(Value::Principal(sender)))
             }
             NativeVariables::ContractCaller => {
                 let sender = env
                     .caller
                     .clone()
                     .ok_or(RuntimeErrorType::NoSenderInContext)?;
-                Ok(Some(sender))
+                Ok(Some(Value::Principal(sender)))
             }
             NativeVariables::BlockHeight => {
+                runtime_cost(ClarityCostFunction::FetchVar, env, 1)?;
                 let block_height = env.global_context.database.get_current_block_height();
                 Ok(Some(Value::UInt(block_height as u128)))
             }
             NativeVariables::BurnBlockHeight => {
+                runtime_cost(ClarityCostFunction::FetchVar, env, 1)?;
                 let burn_block_height = env
                     .global_context
                     .database
@@ -68,6 +73,7 @@ pub fn lookup_reserved_variable(
             NativeVariables::NativeTrue => Ok(Some(Value::Bool(true))),
             NativeVariables::NativeFalse => Ok(Some(Value::Bool(false))),
             NativeVariables::TotalLiquidMicroSTX => {
+                runtime_cost(ClarityCostFunction::FetchVar, env, 1)?;
                 let liq = env.global_context.database.get_total_liquid_ustx();
                 Ok(Some(Value::UInt(liq)))
             }

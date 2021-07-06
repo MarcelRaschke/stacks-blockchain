@@ -1,14 +1,10 @@
 name: stacks-blockchain
 
 # Only run when:
-#   - tags starting with "v" get pushed
 #   - PRs are opened against the master branch
 #   - the workflow is started from the UI (an optional tag can be passed in via parameter)
 #     - If the optional tag parameter is passed in, a new tag will be generated based off the selected branch
 on:
-  push:
-    tags:
-      - 'v*'
   pull_request:
   workflow_dispatch:
     inputs:
@@ -35,20 +31,46 @@ jobs:
           status: STARTING
           color: warning
 
-  # Run tests
-  test:
+  # Run full genesis test
+  full-genesis:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
-      - name: Run bitcoin tests
+      - name: Single full genesis integration test
         env:
           DOCKER_BUILDKIT: 1
-        run: docker build -f ./.github/actions/bitcoin-int-tests/Dockerfile.bitcoin-tests .
-  
+        run: docker build -f ./.github/actions/bitcoin-int-tests/Dockerfile.large-genesis .
+
+  # Run unit tests with code coverage
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Run units tests (with coverage)
+        env:
+          DOCKER_BUILDKIT: 1
+        run: docker build -f ./.github/actions/bitcoin-int-tests/Dockerfile.code-cov .
+
+  open-api-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Run units tests (with coverage)
+        env:
+          DOCKER_BUILDKIT: 1
+        run: docker build -o dist/ -f .github/actions/open-api/Dockerfile.open-api-validate .
+      - name: Upload bundled html
+        uses: actions/upload-artifact@v2
+        with:
+          name: open-api-bundle
+          path: |
+            dist
   # Run net-tests
   nettest:
+    # disable this job/test for now, since we haven't seen this pass
+    #  on github actions in a while, and the failures can take > 4 hours
+    if: ${{ false }}
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v2
       - name: Run network relay tests
@@ -75,12 +97,24 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
+      - name: Set Vars
+        run: |
+          echo "GITHUB_SHA_SHORT=${GITHUB_SHA::7}" >> $GITHUB_ENV
+          echo "GITHUB_REF_SHORT=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
 
       - name: Build distributable
-        env:
-          DIST_TARGET_FILTER: ${{ matrix.platform }}
-        run: build-scripts/build-dist.sh
-
+        uses: docker/build-push-action@v2.2.1
+        with:
+          file: build-scripts/Dockerfile.${{ matrix.platform }}
+          outputs: dist/${{ matrix.platform }}
+          build-args: |
+            STACKS_NODE_VERSION=${{ github.event.inputs.tag || env.GITHUB_SHA_SHORT }}
+            GIT_BRANCH=${{ env.GITHUB_REF_SHORT }}
+            GIT_COMMIT=${{ env.GITHUB_SHA_SHORT }}
+          
       - name: Compress artifact
         run: zip --junk-paths ${{ matrix.platform }} ./dist/${{ matrix.platform }}/*
 
@@ -99,6 +133,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
+      - name: Set Vars
+        run: |
+          echo "GITHUB_SHA_SHORT=${GITHUB_SHA::7}" >> $GITHUB_ENV
+          echo "GITHUB_REF_SHORT=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+
       - name: Build/Tag/Push Image
         uses: docker/build-push-action@v1
         with:
@@ -108,8 +147,9 @@ jobs:
           tags: ${{ github.event.inputs.tag }}
           tag_with_ref: true
           add_git_labels: true
-          # Only push if (a tag was passed in) or (we're building a tag) or (we're building a non-master branch which isn't a PR)
-          push: ${{ github.event.inputs.tag != '' || contains(github.ref, 'refs/tags') || (github.ref != 'refs/heads/master' && !contains(github.ref, 'refs/pull')) }}
+          build_args: STACKS_NODE_VERSION=${{ github.event.inputs.tag || env.GITHUB_SHA_SHORT }},GIT_BRANCH=${{ env.GITHUB_REF_SHORT }},GIT_COMMIT=${{ env.GITHUB_SHA_SHORT }}
+          # Only push if (a tag was passed in) or (we're building a non-master branch which isn't a PR)
+          push: ${{ github.event.inputs.tag != '' || (github.ref != 'refs/heads/master' && !contains(github.ref, 'refs/pull')) }}
 
   # Build docker image, tag it with the git tag and `latest` if running on master branch, and publish under the following conditions
   # Will publish if:
@@ -126,15 +166,20 @@ jobs:
           if [[ -z ${TAG} ]]; then
               REF=$(echo ${GITHUB_REF#refs/*/} | tr / -)
               if [[ "${REF}" == "master" ]]; then
-                  echo "::set-env name=STRETCH_TAG::latest-stretch"
+                  echo "STRETCH_TAG=latest-stretch" >> $GITHUB_ENV
               else
-                  echo "::set-env name=STRETCH_TAG::${REF}-stretch"
+                  echo "STRETCH_TAG=${REF}-stretch" >> $GITHUB_ENV
               fi
           else
-              echo "::set-env name=STRETCH_TAG::${TAG}-stretch"
+              echo "STRETCH_TAG=${TAG}-stretch" >> $GITHUB_ENV
           fi
         env:
           TAG: ${{ github.event.inputs.tag }}
+
+      - name: Set Vars
+        run: |
+          echo "GITHUB_SHA_SHORT=${GITHUB_SHA::7}" >> $GITHUB_ENV
+          echo "GITHUB_REF_SHORT=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
 
       - name: Build/Tag/Push Image
         uses: docker/build-push-action@v1
@@ -146,17 +191,17 @@ jobs:
           tags: ${{ env.STRETCH_TAG }}
           tag_with_ref: false
           add_git_labels: true
-          # Only push if (a tag was passed in) or (we're building a tag) or (we're building a non-master branch which isn't a PR)
-          push: ${{ github.event.inputs.tag != '' || contains(github.ref, 'refs/tags') || (github.ref != 'refs/heads/master' && !contains(github.ref, 'refs/pull')) }}
+          build_args: STACKS_NODE_VERSION=${{ github.event.inputs.tag || env.GITHUB_SHA_SHORT }},GIT_BRANCH=${{ env.GITHUB_REF_SHORT }},GIT_COMMIT=${{ env.GITHUB_SHA_SHORT }}
+          # Only push if (a tag was passed in) or (we're building a non-master branch which isn't a PR)
+          push: ${{ github.event.inputs.tag != '' || (github.ref != 'refs/heads/master' && !contains(github.ref, 'refs/pull')) }}
 
-  # Create a new release if we're building a tag or a tag was passed in
+  # Create a new release if we're building a tag
   create-release:
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.tag != '' || contains(github.ref, 'refs/tags') }}
+    if: ${{ github.event.inputs.tag != '' }}
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}
     needs:
-      - test
       - dist
       - build-publish
       - build-publish-stretch
@@ -166,7 +211,9 @@ jobs:
         id: create_release
         uses: actions/create-release@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Use custom secrets.GH_TOKEN instead of default secrets.GITHUB_TOKEN because the custom token will trigger the
+          # clarity-js-sdk-pr workflow. As events caused by default tokens do not trigger subsequent workflow runs to avoid loops.
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref }}
           release_name: Release ${{ github.event.inputs.tag || github.ref }}
@@ -176,7 +223,7 @@ jobs:
   # Upload distributables to a new release if we're building a tag or a tag was passed in
   upload-dist:
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.tag != '' || contains(github.ref, 'refs/tags') }}
+    if: ${{ github.event.inputs.tag != '' }}
     needs:
       - create-release
     strategy:
@@ -206,7 +253,6 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - notify-start
-      - test
       - dist
       - build-publish
       - build-publish-stretch

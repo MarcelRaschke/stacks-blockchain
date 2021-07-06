@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -26,7 +26,7 @@ pub trait BuildASTPass {
     fn run_pass(contract_ast: &mut ContractAST) -> ParseResult<()>;
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContractAST {
     pub contract_identifier: QualifiedContractIdentifier,
     pub pre_expressions: Vec<PreSymbolicExpression>,

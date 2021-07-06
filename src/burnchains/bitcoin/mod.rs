@@ -1,4 +1,4 @@
-// Copyright (C) 2013-2020 Blocstack PBC, a public benefit corporation
+// Copyright (C) 2013-2020 Blockstack PBC, a public benefit corporation
 // Copyright (C) 2020 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
@@ -17,6 +17,22 @@
 // This module is concerned with the implementation of the BitcoinIndexer
 // structure and its methods and traits.
 
+use std::error;
+use std::fmt;
+use std::io;
+use std::sync::Arc;
+
+use burnchains::bitcoin::address::BitcoinAddress;
+use burnchains::bitcoin::keys::BitcoinPublicKey;
+use burnchains::Txid;
+use chainstate::burn::operations::BlockstackOperationType;
+use deps;
+use deps::bitcoin::network::serialize::Error as btc_serialize_error;
+use util::db::Error as db_error;
+use util::HexError as btc_hex_error;
+
+use crate::types::chainstate::BurnchainHeaderHash;
+
 pub mod address;
 pub mod bits;
 pub mod blocks;
@@ -25,25 +41,6 @@ pub mod keys;
 pub mod messages;
 pub mod network;
 pub mod spv;
-
-use std::error;
-use std::fmt;
-use std::io;
-use std::sync::Arc;
-
-use chainstate::burn::operations::BlockstackOperationType;
-
-use burnchains::bitcoin::address::BitcoinAddress;
-use burnchains::bitcoin::keys::BitcoinPublicKey;
-use burnchains::{BurnchainHeaderHash, Txid};
-
-use deps;
-
-use deps::bitcoin::network::serialize::Error as btc_serialize_error;
-
-use util::HexError as btc_hex_error;
-
-use util::db::Error as db_error;
 
 pub type PeerMessage = deps::bitcoin::network::message::NetworkMessage;
 
@@ -174,6 +171,7 @@ pub struct BitcoinTxInput {
     pub keys: Vec<BitcoinPublicKey>,
     pub num_required: usize,
     pub in_type: BitcoinInputType,
+    pub tx_ref: (Txid, u32),
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
@@ -182,6 +180,8 @@ pub struct BitcoinTransaction {
     pub vtxindex: u32,
     pub opcode: u8,
     pub data: Vec<u8>,
+    /// how much BTC was sent to the data output
+    pub data_amt: u64,
     pub inputs: Vec<BitcoinTxInput>,
     pub outputs: Vec<BitcoinTxOutput>,
 }
