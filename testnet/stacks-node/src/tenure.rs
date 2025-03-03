@@ -1,20 +1,25 @@
-use super::node::{ChainTip, TESTNET_CHAIN_ID};
-use super::{BurnchainTip, Config};
-
 use std::thread;
 use std::time::{Duration, Instant};
 
-use stacks::chainstate::burn::VRFSeed;
+#[cfg(test)]
+use stacks::burnchains::PoxConstants;
+#[cfg(test)]
+use stacks::chainstate::burn::db::sortdb::SortitionDB;
+use stacks::chainstate::burn::db::sortdb::SortitionHandleConn;
 use stacks::chainstate::stacks::db::StacksChainState;
+use stacks::chainstate::stacks::miner::BlockBuilderSettings;
 use stacks::chainstate::stacks::{
     StacksBlock, StacksBlockBuilder, StacksMicroblock, StacksPrivateKey, StacksPublicKey,
     StacksTransaction,
 };
 use stacks::core::mempool::MemPoolDB;
-use stacks::util::hash::Hash160;
-use stacks::util::vrf::VRFProof;
+use stacks_common::types::chainstate::VRFSeed;
+use stacks_common::util::hash::Hash160;
+use stacks_common::util::vrf::VRFProof;
 
-use stacks::vm::database::BurnStateDB;
+/// Only used by the Helium (Mocknet) node
+use super::node::ChainTip;
+use super::{BurnchainTip, Config};
 
 pub struct TenureArtifacts {
     pub anchored_block: StacksBlock,
@@ -36,7 +41,8 @@ pub struct Tenure {
     parent_block_total_burn: u64,
 }
 
-impl<'a> Tenure {
+impl Tenure {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         parent_block: ChainTip,
         coinbase_tx: StacksTransaction,
@@ -67,7 +73,7 @@ impl<'a> Tenure {
         }
     }
 
-    pub fn run(&mut self, burn_dbconn: &dyn BurnStateDB) -> Option<TenureArtifacts> {
+    pub fn run(&mut self, burn_dbconn: &SortitionHandleConn) -> Option<TenureArtifacts> {
         info!("Node starting new tenure with VRF {:?}", self.vrf_seed);
 
         let duration_left: u128 = self.config.burnchain.commit_anchor_block_within as u128;
@@ -77,24 +83,26 @@ impl<'a> Tenure {
             elapsed = Instant::now().duration_since(self.burnchain_tip.received_at);
         }
 
-        let (mut chain_state, _) = StacksChainState::open_with_block_limit(
-            false,
-            TESTNET_CHAIN_ID,
-            &self.config.get_chainstate_path(),
-            self.config.block_limit.clone(),
+        let (chain_state, _) = StacksChainState::open(
+            self.config.is_mainnet(),
+            self.config.burnchain.chain_id,
+            &self.config.get_chainstate_path_str(),
+            Some(self.config.node.get_marf_opts()),
         )
         .unwrap();
 
         let (anchored_block, _, _) = StacksBlockBuilder::build_anchored_block(
-            &mut chain_state,
+            &chain_state,
             burn_dbconn,
             &mut self.mem_pool,
             &self.parent_block.metadata,
             self.parent_block_total_burn,
             self.vrf_proof.clone(),
-            self.microblock_pubkeyhash.clone(),
+            self.microblock_pubkeyhash,
             &self.coinbase_tx,
-            self.config.block_limit.clone(),
+            BlockBuilderSettings::limited(),
+            None,
+            &self.config.get_burnchain(),
         )
         .unwrap();
 
@@ -107,5 +115,29 @@ impl<'a> Tenure {
             burn_fee: self.burn_fee_cap,
         };
         Some(artifact)
+    }
+
+    #[cfg(test)]
+    pub fn open_chainstate(&self) -> StacksChainState {
+        use stacks::core::CHAIN_ID_TESTNET;
+
+        let (chain_state, _) = StacksChainState::open(
+            false,
+            CHAIN_ID_TESTNET,
+            &self.config.get_chainstate_path_str(),
+            Some(self.config.node.get_marf_opts()),
+        )
+        .unwrap();
+        chain_state
+    }
+
+    #[cfg(test)]
+    pub fn open_fake_sortdb(&self) -> SortitionDB {
+        SortitionDB::open(
+            &self.config.get_burn_db_file_path(),
+            true,
+            PoxConstants::testnet_default(),
+        )
+        .unwrap()
     }
 }

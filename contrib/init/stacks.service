@@ -1,0 +1,68 @@
+## Modeled after https://github.com/bitcoin/bitcoin/blob/master/contrib/init/bitcoind.service
+
+[Unit]
+Description=Stacks Blockchain
+# https://www.freedesktop.org/wiki/Software/systemd/NetworkTarget/
+After=network-online.target
+Wants=network-online.target
+
+ConditionFileIsExecutable=/usr/local/bin/stacks-node
+ConditionPathExists=/etc/stacks-blockchain/Config.toml
+ConditionPathIsDirectory=/stacks-blockchain
+
+[Service]
+ExecStart=/usr/local/bin/stacks-node start --config /etc/stacks-blockchain/Config.toml
+
+# Make sure the config directory is readable by the service user
+PermissionsStartOnly=true
+ExecStartPre=/bin/chgrp stacks /etc/stacks-blockchain/
+
+# Process management
+####################
+PIDFile=/run/stacks-blockchain/stacks-blockchain.pid
+Restart=no
+TimeoutStopSec=600
+KillSignal=SIGINT
+SendSIGKILL=no
+
+# Directory creation and permissions
+####################################
+# Run as stacks:stacks
+User=stacks
+Group=stacks
+
+# /run/stacks-blockchain
+RuntimeDirectory=stacks-blockchain
+RuntimeDirectoryMode=0710
+
+# /etc/stacks-blockchain
+ConfigurationDirectory=stacks-blockchain
+ConfigurationDirectoryMode=0710
+
+# Hardening measures
+####################
+
+# Provide a private /tmp and /var/tmp.
+PrivateTmp=true
+
+# Mount /usr, /boot/ and /etc read-only for the process.
+ProtectSystem=full
+
+# Deny access to /home, /root and /run/user
+ProtectHome=true
+
+# Disallow the process and all of its children to gain
+# new privileges through execve().
+NoNewPrivileges=true
+
+# Use a new /dev namespace only populated with API pseudo devices
+# such as /dev/null, /dev/zero and /dev/random.
+PrivateDevices=true
+
+# Deny the creation of writable and executable memory mappings.
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+

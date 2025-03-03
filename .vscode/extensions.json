@@ -1,8 +1,8 @@
 {
     "recommendations": [
-        "matklad.rust-analyzer",
+        "rust-lang.rust-analyzer",
         "vadimcn.vscode-lldb",
-        "serayuzgur.crates",
+        "fill-labs.dependi",
         "editorconfig.editorconfig",
     ]
 }

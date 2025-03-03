@@ -1,10 +1,11 @@
+use stacks::chainstate::stacks::db::ClarityTx;
+use stacks_common::types::chainstate::BurnchainHeaderHash;
+
+use super::RunLoopCallbacks;
 use crate::burnchains::Error as BurnchainControllerError;
 use crate::{
     BitcoinRegtestController, BurnchainController, ChainTip, Config, MocknetController, Node,
 };
-use stacks::chainstate::stacks::db::ClarityTx;
-
-use super::RunLoopCallbacks;
 
 /// RunLoop is coordinating a simulated burnchain and some simulated nodes
 /// taking turns in producing blocks.
@@ -16,14 +17,11 @@ pub struct RunLoop {
 
 impl RunLoop {
     pub fn new(config: Config) -> Self {
-        RunLoop::new_with_boot_exec(config, |_| {})
+        RunLoop::new_with_boot_exec(config, Box::new(|_| {}))
     }
 
     /// Sets up a runloop and node, given a config.
-    pub fn new_with_boot_exec<F>(config: Config, boot_exec: F) -> Self
-    where
-        F: Fn(&mut ClarityTx) -> (),
-    {
+    pub fn new_with_boot_exec(config: Config, boot_exec: Box<dyn FnOnce(&mut ClarityTx)>) -> Self {
         // Build node based on config
         let node = Node::new(config.clone(), boot_exec);
 
@@ -65,7 +63,7 @@ impl RunLoop {
         // Sync and update node with this new block.
         let (burnchain_tip, _) = burnchain.sync(None)?;
         self.node.process_burnchain_state(&burnchain_tip); // todo(ludo): should return genesis?
-        let mut chain_tip = ChainTip::genesis(self.config.get_initial_liquid_ustx());
+        let mut chain_tip = ChainTip::genesis(&BurnchainHeaderHash::zero(), 0, 0);
 
         self.node.spawn_peer_server();
 
@@ -88,8 +86,11 @@ impl RunLoop {
         let _ = burnchain.sortdb_mut();
 
         // Run the tenure, keep the artifacts
-        let artifacts_from_1st_tenure = match first_tenure.run(&burnchain.sortdb_ref().index_conn())
-        {
+        let artifacts_from_1st_tenure = match first_tenure.run(
+            &burnchain
+                .sortdb_ref()
+                .index_handle(&burnchain_tip.block_snapshot.sortition_id),
+        ) {
             Some(res) => res,
             None => panic!("Error while running 1st tenure"),
         };
@@ -120,12 +121,14 @@ impl RunLoop {
 
         // Have the node process its own tenure.
         // We should have some additional checks here, and ensure that the previous artifacts are legit.
+        let mut atlas_db = self.node.make_atlas_db();
 
         chain_tip = self.node.process_tenure(
             &artifacts_from_1st_tenure.anchored_block,
             &last_sortitioned_block.block_snapshot.consensus_hash,
             artifacts_from_1st_tenure.microblocks.clone(),
             burnchain.sortdb_mut(),
+            &mut atlas_db,
         );
 
         self.callbacks.invoke_new_stacks_chain_state(
@@ -133,7 +136,9 @@ impl RunLoop {
             &burnchain_tip,
             &chain_tip,
             &mut self.node.chain_state,
-            &burnchain.sortdb_ref().index_conn(),
+            &burnchain
+                .sortdb_ref()
+                .index_handle(&burnchain_tip.block_snapshot.sortition_id),
         );
 
         // If the node we're looping on won the sortition, initialize and configure the next tenure
@@ -157,22 +162,23 @@ impl RunLoop {
                         &chain_tip,
                         &mut tenure,
                     );
-                    tenure.run(&burnchain.sortdb_ref().index_conn())
+                    tenure.run(
+                        &burnchain
+                            .sortdb_ref()
+                            .index_handle(&burnchain_tip.block_snapshot.sortition_id),
+                    )
                 }
                 None => None,
             };
 
-            match artifacts_from_tenure {
-                Some(ref artifacts) => {
-                    // Have each node receive artifacts from the current tenure
-                    self.node.commit_artifacts(
-                        &artifacts.anchored_block,
-                        &artifacts.parent_block,
-                        &mut burnchain,
-                        artifacts.burn_fee,
-                    );
-                }
-                None => {}
+            if let Some(artifacts) = &artifacts_from_tenure {
+                // Have each node receive artifacts from the current tenure
+                self.node.commit_artifacts(
+                    &artifacts.anchored_block,
+                    &artifacts.parent_block,
+                    &mut burnchain,
+                    artifacts.burn_fee,
+                );
             }
 
             let (new_burnchain_tip, _) = burnchain.sync(None)?;
@@ -196,11 +202,14 @@ impl RunLoop {
                 Some(ref artifacts) => {
                     // Have the node process its tenure.
                     // We should have some additional checks here, and ensure that the previous artifacts are legit.
+                    let mut atlas_db = self.node.make_atlas_db();
+
                     chain_tip = self.node.process_tenure(
                         &artifacts.anchored_block,
                         &last_sortitioned_block.block_snapshot.consensus_hash,
                         artifacts.microblocks.clone(),
                         burnchain.sortdb_mut(),
+                        &mut atlas_db,
                     );
 
                     self.callbacks.invoke_new_stacks_chain_state(
@@ -208,7 +217,9 @@ impl RunLoop {
                         &burnchain_tip,
                         &chain_tip,
                         &mut self.node.chain_state,
-                        &burnchain.sortdb_ref().index_conn(),
+                        &burnchain
+                            .sortdb_ref()
+                            .index_handle(&burnchain_tip.block_snapshot.sortition_id),
                     );
                 }
             };

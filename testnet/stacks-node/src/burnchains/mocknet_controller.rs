@@ -1,22 +1,29 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use super::super::operations::BurnchainOpSigner;
-use super::super::Config;
-
-use super::{BurnchainController, BurnchainTip, Error as BurnchainControllerError};
+use clarity::vm::costs::ExecutionCost;
 use stacks::burnchains::bitcoin::BitcoinBlock;
 use stacks::burnchains::{
-    Burnchain, BurnchainBlock, BurnchainBlockHeader, BurnchainHeaderHash,
-    BurnchainStateTransitionOps, Txid,
+    Burnchain, BurnchainBlock, BurnchainBlockHeader, BurnchainStateTransitionOps, Txid,
 };
-use stacks::chainstate::burn::db::sortdb::{PoxId, SortitionDB, SortitionHandleTx};
+use stacks::chainstate::burn::db::sortdb::{SortitionDB, SortitionHandleTx};
+use stacks::chainstate::burn::operations::leader_block_commit::BURN_BLOCK_MINED_AT_MODULUS;
 use stacks::chainstate::burn::operations::{
-    BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp, UserBurnSupportOp,
+    BlockstackOperationType, DelegateStxOp, LeaderBlockCommitOp, LeaderKeyRegisterOp, PreStxOp,
+    StackStxOp, TransferStxOp, VoteForAggregateKeyOp,
 };
 use stacks::chainstate::burn::BlockSnapshot;
-use stacks::util::get_epoch_time_secs;
-use stacks::util::hash::Sha256Sum;
+use stacks::core::{
+    EpochList, StacksEpoch, StacksEpochId, PEER_VERSION_EPOCH_2_0, PEER_VERSION_EPOCH_2_05,
+    PEER_VERSION_EPOCH_2_1, STACKS_EPOCH_MAX,
+};
+use stacks_common::types::chainstate::{BurnchainHeaderHash, PoxId};
+use stacks_common::util::get_epoch_time_secs;
+use stacks_common::util::hash::Sha256Sum;
+
+use super::super::operations::BurnchainOpSigner;
+use super::super::Config;
+use super::{BurnchainController, BurnchainTip, Error as BurnchainControllerError};
 
 /// MocknetController is simulating a simplistic burnchain.
 pub struct MocknetController {
@@ -34,16 +41,11 @@ impl MocknetController {
 
     fn new(config: Config) -> Self {
         debug!("Opening Burnchain at {}", &config.get_burn_db_path());
-        let burnchain = Burnchain::new(
-            &config.get_burn_db_path(),
-            &config.burnchain.chain,
-            &"regtest".to_string(),
-        )
-        .expect("Error while instantiating burnchain");
+        let burnchain = config.get_burnchain();
 
         Self {
-            config: config,
-            burnchain: burnchain,
+            config,
+            burnchain,
             db: None,
             queued_operations: VecDeque::new(),
             chain_tip: None,
@@ -52,13 +54,13 @@ impl MocknetController {
 
     fn build_next_block_header(current_block: &BlockSnapshot) -> BurnchainBlockHeader {
         let curr_hash = &current_block.burn_header_hash.to_bytes()[..];
-        let next_hash = Sha256Sum::from_data(&curr_hash);
+        let next_hash = Sha256Sum::from_data(curr_hash);
 
         let block = BurnchainBlock::Bitcoin(BitcoinBlock::new(
             current_block.block_height + 1,
             &BurnchainHeaderHash::from_bytes(next_hash.as_bytes()).unwrap(),
             &current_block.burn_header_hash,
-            &vec![],
+            vec![],
             get_epoch_time_secs(),
         ));
         block.header()
@@ -79,7 +81,7 @@ impl BurnchainController for MocknetController {
         }
     }
 
-    fn get_chain_tip(&mut self) -> BurnchainTip {
+    fn get_chain_tip(&self) -> BurnchainTip {
         match &self.chain_tip {
             Some(chain_tip) => chain_tip.clone(),
             None => {
@@ -88,15 +90,58 @@ impl BurnchainController for MocknetController {
         }
     }
 
+    fn get_headers_height(&self) -> u64 {
+        match &self.chain_tip {
+            Some(chain_tip) => chain_tip.block_snapshot.block_height,
+            None => {
+                unreachable!();
+            }
+        }
+    }
+
+    fn get_stacks_epochs(&self) -> EpochList {
+        match &self.config.burnchain.epochs {
+            Some(epochs) => epochs.clone(),
+            None => EpochList::new(&[
+                StacksEpoch {
+                    epoch_id: StacksEpochId::Epoch20,
+                    start_height: 0,
+                    end_height: 1,
+                    block_limit: ExecutionCost::max_value(),
+                    network_epoch: PEER_VERSION_EPOCH_2_0,
+                },
+                StacksEpoch {
+                    epoch_id: StacksEpochId::Epoch2_05,
+                    start_height: 1,
+                    end_height: 2,
+                    block_limit: ExecutionCost::max_value(),
+                    network_epoch: PEER_VERSION_EPOCH_2_05,
+                },
+                StacksEpoch {
+                    epoch_id: StacksEpochId::Epoch21,
+                    start_height: 2,
+                    end_height: STACKS_EPOCH_MAX,
+                    block_limit: ExecutionCost::max_value(),
+                    network_epoch: PEER_VERSION_EPOCH_2_1,
+                },
+            ]),
+        }
+    }
+
     fn start(
         &mut self,
         _ignored_target_height_opt: Option<u64>,
     ) -> Result<(BurnchainTip, u64), BurnchainControllerError> {
+        // If `config` sets a value, use that. Otherwise, use a default.
+        let epoch_vector = self.get_stacks_epochs();
         let db = match SortitionDB::connect(
             &self.config.get_burn_db_file_path(),
             0,
-            &BurnchainHeaderHash([0u8; 32]),
+            &BurnchainHeaderHash::zero(),
             get_epoch_time_secs(),
+            &epoch_vector,
+            self.burnchain.pox_constants.clone(),
+            None,
             true,
         ) {
             Ok(db) => db,
@@ -119,12 +164,14 @@ impl BurnchainController for MocknetController {
 
     fn submit_operation(
         &mut self,
+        _epoch_id: StacksEpochId,
         operation: BlockstackOperationType,
         _op_signer: &mut BurnchainOpSigner,
         _attempt: u64,
-    ) -> bool {
+    ) -> Result<Txid, BurnchainControllerError> {
+        let txid = operation.txid();
         self.queued_operations.push_back(operation);
-        true
+        Ok(txid)
     }
 
     fn sync(
@@ -135,31 +182,25 @@ impl BurnchainController for MocknetController {
 
         // Simulating mining
         let next_block_header = Self::build_next_block_header(&chain_tip.block_snapshot);
-        let mut vtxindex = 1;
         let mut ops = vec![];
 
         while let Some(payload) = self.queued_operations.pop_front() {
-            let txid = Txid(
-                Sha256Sum::from_data(
-                    format!("{}::{}", next_block_header.block_height, vtxindex).as_bytes(),
-                )
-                .0,
-            );
             let op = match payload {
                 BlockstackOperationType::LeaderKeyRegister(payload) => {
                     BlockstackOperationType::LeaderKeyRegister(LeaderKeyRegisterOp {
                         consensus_hash: payload.consensus_hash,
                         public_key: payload.public_key,
                         memo: payload.memo,
-                        address: payload.address,
-                        txid,
-                        vtxindex: vtxindex,
+                        txid: payload.txid,
+                        vtxindex: payload.vtxindex,
                         block_height: next_block_header.block_height,
                         burn_header_hash: next_block_header.block_hash,
                     })
                 }
                 BlockstackOperationType::LeaderBlockCommit(payload) => {
                     BlockstackOperationType::LeaderBlockCommit(LeaderBlockCommitOp {
+                        treatment: vec![],
+                        sunset_burn: 0,
                         block_header_hash: payload.block_header_hash,
                         new_seed: payload.new_seed,
                         parent_block_ptr: payload.parent_block_ptr,
@@ -168,32 +209,57 @@ impl BurnchainController for MocknetController {
                         key_vtxindex: payload.key_vtxindex,
                         memo: payload.memo,
                         burn_fee: payload.burn_fee,
+                        apparent_sender: payload.apparent_sender,
                         input: payload.input,
                         commit_outs: payload.commit_outs,
-                        txid,
-                        vtxindex: vtxindex,
+                        txid: payload.txid,
+                        vtxindex: payload.vtxindex,
                         block_height: next_block_header.block_height,
+                        burn_parent_modulus: if next_block_header.block_height > 0 {
+                            (next_block_header.block_height - 1) % BURN_BLOCK_MINED_AT_MODULUS
+                        } else {
+                            BURN_BLOCK_MINED_AT_MODULUS - 1
+                        } as u8,
                         burn_header_hash: next_block_header.block_hash,
                     })
                 }
-                BlockstackOperationType::UserBurnSupport(payload) => {
-                    BlockstackOperationType::UserBurnSupport(UserBurnSupportOp {
-                        address: payload.address,
-                        consensus_hash: payload.consensus_hash,
-                        public_key: payload.public_key,
-                        key_block_ptr: payload.key_block_ptr,
-                        key_vtxindex: payload.key_vtxindex,
-                        block_header_hash_160: payload.block_header_hash_160,
-                        burn_fee: payload.burn_fee,
-                        txid,
-                        vtxindex: vtxindex,
+                BlockstackOperationType::PreStx(payload) => {
+                    BlockstackOperationType::PreStx(PreStxOp {
                         block_height: next_block_header.block_height,
                         burn_header_hash: next_block_header.block_hash,
+                        ..payload
+                    })
+                }
+                BlockstackOperationType::TransferStx(payload) => {
+                    BlockstackOperationType::TransferStx(TransferStxOp {
+                        block_height: next_block_header.block_height,
+                        burn_header_hash: next_block_header.block_hash,
+                        ..payload
+                    })
+                }
+                BlockstackOperationType::StackStx(payload) => {
+                    BlockstackOperationType::StackStx(StackStxOp {
+                        block_height: next_block_header.block_height,
+                        burn_header_hash: next_block_header.block_hash,
+                        ..payload
+                    })
+                }
+                BlockstackOperationType::DelegateStx(payload) => {
+                    BlockstackOperationType::DelegateStx(DelegateStxOp {
+                        block_height: next_block_header.block_height,
+                        burn_header_hash: next_block_header.block_hash,
+                        ..payload
+                    })
+                }
+                BlockstackOperationType::VoteForAggregateKey(payload) => {
+                    BlockstackOperationType::VoteForAggregateKey(VoteForAggregateKeyOp {
+                        block_height: next_block_header.block_height,
+                        burn_header_hash: next_block_header.block_hash,
+                        ..payload
                     })
                 }
             };
             ops.push(op);
-            vtxindex += 1;
         }
 
         // Include txs in a new block
@@ -208,6 +274,7 @@ impl BurnchainController for MocknetController {
                             .unwrap();
                     let new_chain_tip = burn_tx
                         .process_block_ops(
+                            false,
                             &self.burnchain,
                             &chain_tip.block_snapshot,
                             &next_block_header,
@@ -215,6 +282,7 @@ impl BurnchainController for MocknetController {
                             None,
                             PoxId::stubbed(),
                             None,
+                            0,
                         )
                         .unwrap();
                     burn_tx.commit().unwrap();
@@ -242,4 +310,8 @@ impl BurnchainController for MocknetController {
 
     #[cfg(test)]
     fn bootstrap_chain(&mut self, _num_blocks: u64) {}
+
+    fn connect_dbs(&mut self) -> Result<(), BurnchainControllerError> {
+        Ok(())
+    }
 }
